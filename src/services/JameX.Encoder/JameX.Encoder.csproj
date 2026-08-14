@@ -1,0 +1,20 @@
+<!--
+  Web SDK rather than Worker SDK. The Encoder does no request serving, but it
+  still needs liveness and readiness endpoints so an orchestrator can tell a
+  wedged encoder from a busy one — and its transcode work runs as a hosted
+  service exactly as it would under the Worker SDK.
+-->
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\shared\JameX.Contracts\JameX.Contracts.csproj" />
+    <ProjectReference Include="..\..\shared\JameX.ServiceDefaults\JameX.ServiceDefaults.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,217 @@
+name: jamex
+
+# Local stand-in for the production topology in the design doc.
+#
+#   doc component              -> service here
+#   -------------------------------------------------------------------
+#   Load balancer / entry      -> gateway (YARP)
+#   User DB (strong consist.)  -> postgres    jamex_users      (Identity)
+#   Metadata DB (eventual)     -> postgres    jamex_catalog    (Catalog)
+#   Bigtable (thumbs/counters) -> localstack  DynamoDB
+#   Blob store (GFS/S3)        -> localstack  S3 jamex-media
+#   Upload storage (temp)      -> localstack  S3 jamex-raw
+#   Encoder fan-out            -> localstack  SNS topic -> 4 SQS queues
+#   Memcached distributed $    -> redis
+#   CDN / ISP PoP              -> edge (nginx proxy_cache)
+#   Web + application tier     -> identity, catalog, ingest, engagement, search
+#   Encoders                   -> encoder (FFmpeg)
+
+x-service-base: &service-base
+  restart: unless-stopped
+  environment: &service-env
+    ASPNETCORE_ENVIRONMENT: Development
+    ASPNETCORE_URLS: http://+:8080
+    ConnectionStrings__Redis: "redis:6379"
+    Aws__ServiceUrl: "http://localstack:4566"
+    Aws__PublicServiceUrl: "http://localhost:4566"
+    Aws__Region: "us-east-1"
+    Aws__AccessKey: "test"
+    Aws__SecretKey: "test"
+    Storage__RawBucket: "jamex-raw"
+    Storage__MediaBucket: "jamex-media"
+    Storage__CdnBaseUrl: "http://localhost:8090/media"
+    Messaging__TopicName: "jamex-video-events"
+  depends_on: &service-deps
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- platform
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: jamex-postgres
+    environment:
+      POSTGRES_USER: jamex
+      POSTGRES_PASSWORD: jamex
+      # Neutral admin database; the init script creates one database per
+      # owning service.
+      POSTGRES_DB: jamex
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jamex -d jamex"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: jamex-redis
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4
+    container_name: jamex-localstack
+    environment:
+      SERVICES: s3,sqs,sns,dynamodb
+      DEBUG: "0"
+      AWS_DEFAULT_REGION: us-east-1
+      # Presigned URLs go to the browser, so S3 must be addressable under the
+      # same hostname the browser uses.
+      LOCALSTACK_HOST: localhost:4566
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./infra/localstack/init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      # Passes only once the bootstrap script has finished, so any service that
+      # waits for localstack to be healthy is guaranteed its queue exists.
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name jamex-engagement-events || exit 1"]
+      interval: 6s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  # Stands in for the CDN / ISP point-of-presence tier. Caches media on first
+  # miss; watch X-JameX-Cache flip MISS -> HIT while the player pulls segments.
+  edge:
+    image: nginx:1.27-alpine
+    container_name: jamex-edge
+    ports:
+      - "8090:80"
+    volumes:
+      - ./infra/edge/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- services
+
+  gateway:
+    <<: *service-base
+    container_name: jamex-gateway
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Gateway }
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *service-env
+      # YARP destinations resolve over the compose network, not localhost.
+      ReverseProxy__Clusters__identity__Destinations__d1__Address:   "http://identity:8080/"
+      ReverseProxy__Clusters__catalog__Destinations__d1__Address:    "http://catalog:8080/"
+      ReverseProxy__Clusters__ingest__Destinations__d1__Address:     "http://ingest:8080/"
+      ReverseProxy__Clusters__engagement__Destinations__d1__Address: "http://engagement:8080/"
+      ReverseProxy__Clusters__search__Destinations__d1__Address:     "http://search:8080/"
+    depends_on:
+      <<: *service-deps
+
+  identity:
+    <<: *service-base
+    container_name: jamex-identity
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Identity }
+    ports:
+      - "8081:8080"
+    environment:
+      <<: *service-env
+      ConnectionStrings__Identity: "Host=postgres;Database=jamex_users;Username=jamex;Password=jamex"
+
+  catalog:
+    <<: *service-base
+    container_name: jamex-catalog
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Catalog }
+    ports:
+      - "8082:8080"
+    environment:
+      <<: *service-env
+      ConnectionStrings__Catalog: "Host=postgres;Database=jamex_catalog;Username=jamex;Password=jamex"
+      Messaging__QueueName: "jamex-catalog-events"
+
+  ingest:
+    <<: *service-base
+    container_name: jamex-ingest
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Ingest }
+    ports:
+      - "8083:8080"
+
+  engagement:
+    <<: *service-base
+    container_name: jamex-engagement
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Engagement }
+    ports:
+      - "8084:8080"
+    environment:
+      <<: *service-env
+      ConnectionStrings__Engagement: "Host=postgres;Database=jamex_engagement;Username=jamex;Password=jamex"
+      Messaging__QueueName: "jamex-engagement-events"
+
+  search:
+    <<: *service-base
+    container_name: jamex-search
+    build:
+      context: .
+      dockerfile: infra/docker/Service.Dockerfile
+      args: { SERVICE: Search }
+    ports:
+      - "8085:8080"
+    environment:
+      <<: *service-env
+      Messaging__QueueName: "jamex-search-events"
+
+  encoder:
+    <<: *service-base
+    container_name: jamex-encoder
+    build:
+      context: .
+      dockerfile: infra/docker/Encoder.Dockerfile
+    ports:
+      - "8086:8080"
+    environment:
+      <<: *service-env
+      Messaging__QueueName: "jamex-encoder-jobs"
+      # Transcoding runs long, so the consumer holds a wider visibility window
+      # and extends it by heartbeat while a job is in flight.
+      Messaging__VisibilityTimeoutSeconds: "900"
+      Encoding__Provider: "FFmpeg"
+      Encoding__WorkDirectory: "/var/jamex/work"
+
+volumes:
+  pgdata:

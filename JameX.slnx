@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/services/">
+    <Project Path="src/services/JameX.Catalog/JameX.Catalog.csproj" />
+    <Project Path="src/services/JameX.Encoder/JameX.Encoder.csproj" />
+    <Project Path="src/services/JameX.Engagement/JameX.Engagement.csproj" />
+    <Project Path="src/services/JameX.Gateway/JameX.Gateway.csproj" />
+    <Project Path="src/services/JameX.Identity/JameX.Identity.csproj" />
+    <Project Path="src/services/JameX.Ingest/JameX.Ingest.csproj" />
+    <Project Path="src/services/JameX.Search/JameX.Search.csproj" />
+  </Folder>
+  <Folder Name="/src/shared/">
+    <Project Path="src/shared/JameX.Contracts/JameX.Contracts.csproj" />
+    <Project Path="src/shared/JameX.ServiceDefaults/JameX.ServiceDefaults.csproj" />
+  </Folder>
+</Solution>

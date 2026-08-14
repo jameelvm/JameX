@@ -1,0 +1,11 @@
+bin/
+obj/
+node_modules/
+.next/
+out/
+.vs/
+.vscode/
+*.user
+.env
+.env.local
+work/
