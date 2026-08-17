@@ -1,3 +1,4 @@
+using JameX.Catalog;
 using JameX.Catalog.Data;
 using JameX.ServiceDefaults.Data;
 using JameX.ServiceDefaults.Hosting;
@@ -14,8 +15,8 @@ builder.AddJameXApiDefaults();
 builder.AddJameXPostgres<CatalogDbContext>("Catalog");
 
 // Consumes VideoUploaded (create the metadata row) and VideoEncoded /
-// VideoEncodingFailed (advance status, record the ladder). Handlers arrive in
-// phase 3.
+// VideoEncodingFailed (advance status, record the ladder).
+builder.Services.AddCatalogServices();
 builder.Services.AddJameXEventConsumer();
 
 var app = builder.Build();
