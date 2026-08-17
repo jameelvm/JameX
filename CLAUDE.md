@@ -40,7 +40,7 @@ per-service SQS queues with subscription filter policies.
 
 | Layer | Choice |
 |---|---|
-| Services | .NET 10, ASP.NET Core minimal APIs |
+| Services | .NET 10, ASP.NET Core MVC controllers |
 | Gateway | YARP |
 | Relational | PostgreSQL 17 — one database per owning service |
 | Wide-column / KV | DynamoDB (stands in for the doc's Bigtable) |
@@ -84,6 +84,15 @@ App/
 - **One service owns a store.** No service reads another's database. If it needs
   data it does not own, it calls the owner's API or reacts to its events. This
   is the rule that stops this becoming a distributed monolith.
+- **Layered inside each service**, so the transport stays replaceable:
+  `Api/` (controllers — routing and status codes only) → `Services/`
+  (application logic, returns `OperationResult<T>`, never touches HTTP) →
+  `Repositories/` (intention-revealing data access; EF and Npgsql stop here) →
+  `Domain/`. Supporting folders: `Contracts/` (inbound requests), `Mapping/`,
+  `Validation/`, `Data/`.
+- **Controllers, not minimal APIs.** `[ApiController]` supplies model-state
+  validation, binding-source inference and ProblemDetails that would otherwise
+  be hand-rolled per service, and enforces one consistent shape across seven.
 - `JameX.Contracts` holds only what crosses a boundary — events and public DTOs.
   Entities stay internal to their owning service.
 - Event handlers must be idempotent: SNS→SQS delivery is at-least-once.

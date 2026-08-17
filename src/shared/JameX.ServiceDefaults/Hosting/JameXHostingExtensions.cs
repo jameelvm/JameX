@@ -2,8 +2,10 @@ using JameX.ServiceDefaults.Aws;
 using JameX.ServiceDefaults.Configuration;
 using JameX.ServiceDefaults.Messaging;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
@@ -74,8 +76,16 @@ public static class JameXHostingExtensions
     /// </summary>
     public static WebApplicationBuilder AddJameXApiDefaults(this WebApplicationBuilder builder)
     {
+        // Controllers rather than minimal APIs. The trade is ceremony for
+        // enforced structure: [ApiController] supplies automatic model-state
+        // validation, binding-source inference and ProblemDetails responses
+        // that minimal APIs would have each service hand-roll. It also brings
+        // ApiExplorer, which is what AddOpenApi documents the routes from.
+        builder.Services.AddControllers();
+
         builder.Services.AddOpenApi();
         builder.Services.AddProblemDetails();
+        builder.Services.AddExceptionHandler<UnauthorizedExceptionHandler>();
 
         // The browser talks to the Gateway, but during development it is useful
         // to be able to hit a service directly from the Next.js origin.
@@ -106,6 +116,17 @@ public static class JameXHostingExtensions
     }
 
     /// <summary>
+    /// Translates exceptions that carry an HTTP meaning into the status code
+    /// they mean, so a missing caller identity is a 401 rather than a 500.
+    /// Register early: it only catches what is thrown after it.
+    /// </summary>
+    public static WebApplication UseJameXExceptionHandling(this WebApplication app)
+    {
+        app.UseExceptionHandler();
+        return app;
+    }
+
+    /// <summary>
     /// Endpoints every service exposes: liveness, readiness and API docs.
     /// </summary>
     public static WebApplication MapJameXDefaultEndpoints(this WebApplication app, string serviceName)
@@ -129,6 +150,13 @@ public static class JameXHostingExtensions
             docs = "/scalar",
             health = new[] { "/health/live", "/health/ready" }
         })).ExcludeFromDescription();
+
+        // Attribute-routed controllers, but only for hosts that asked for an
+        // API. Encoder is a pure worker: it calls AddJameXServiceDefaults and
+        // never AddJameXApiDefaults, so MVC was never registered and mapping
+        // controllers would throw at startup. Feature-detect rather than assume.
+        if (app.Services.GetService<IActionDescriptorCollectionProvider>() is not null)
+            app.MapControllers();
 
         if (app.Environment.IsDevelopment())
         {
@@ -155,6 +183,24 @@ public interface ICurrentUser
 {
     Guid? UserId { get; }
     Guid RequireUserId();
+}
+
+/// <summary>
+/// <see cref="ICurrentUser.RequireUserId"/> throws when the caller is anonymous.
+/// Without this that surfaces as a 500 — an authentication problem reported as a
+/// server fault, which is both wrong and unactionable for the client.
+/// </summary>
+internal sealed class UnauthorizedExceptionHandler : IExceptionHandler
+{
+    public async ValueTask<bool> TryHandleAsync(
+        HttpContext context, Exception exception, CancellationToken ct)
+    {
+        if (exception is not UnauthorizedAccessException) return false;
+
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        await context.Response.WriteAsJsonAsync(new { error = exception.Message }, ct);
+        return true;
+    }
 }
 
 internal sealed class HeaderCurrentUser(IHttpContextAccessor accessor) : ICurrentUser
