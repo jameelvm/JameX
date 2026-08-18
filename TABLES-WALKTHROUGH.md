@@ -1,13 +1,16 @@
 # Catalog tables — a walkthrough with real data
 
-**Temporary file.** This exists to make the four `jamex_catalog` tables concrete
-by following one video through its whole life. It will be folded into
-`README.md` when phase 3 closes, then deleted.
+Companion to `README.md` §8 — the long-form version, in plain language, with the
+full event payloads and every column accounted for. `README.md` §8.5 carries the
+condensed walkthrough; this file is the one to read when a column's purpose is
+unclear.
 
-> **Status note.** The four tables are real and exist right now (Module 3).
-> The *handlers* that write them are Modules 4 and 6, not built yet. So steps
-> marked **(Module 4)** or **(Module 6)** describe what the code will do —
-> the shapes of the rows are already fixed by the schema.
+> **Status: all of this is now built and verified** (phase 3, modules 3–6).
+> Steps still labelled *(Module 4)* / *(Module 6)* below refer to when the code
+> was written, not to anything outstanding. The one exception is **Step 1** —
+> Ingest does not exist yet, so nothing publishes `VideoUploaded` in the real
+> system until phase 4. Phase 3's handlers were tested by publishing these exact
+> events by hand.
 
 ---
 

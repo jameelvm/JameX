@@ -47,6 +47,14 @@ public sealed class OperationResult<T>
     public static OperationResult<T> Conflict(string error) =>
         new(ResultStatus.Conflict, default, error, null);
 
+    /// <summary>
+    /// The caller is known but not allowed. Distinct from
+    /// <see cref="NotFound"/>: 404 says "no such thing", 403 says "it exists
+    /// and it is not yours".
+    /// </summary>
+    public static OperationResult<T> Forbidden(string error) =>
+        new(ResultStatus.Forbidden, default, error, null);
+
     public static OperationResult<T> Invalid(string field, string message) =>
         new(ResultStatus.Invalid, default, null,
             new Dictionary<string, string[]> { [field] = [message] });
@@ -57,7 +65,8 @@ public enum ResultStatus
     Success = 0,
     NotFound = 1,
     Conflict = 2,
-    Invalid = 3
+    Invalid = 3,
+    Forbidden = 4
 }
 
 /// <summary>
@@ -83,6 +92,10 @@ public static class ActionResultExtensions
                 ? new NotFoundResult()
                 : new NotFoundObjectResult(new { error = result.Error }),
             ResultStatus.Conflict => new ConflictObjectResult(new { error = result.Error }),
+            ResultStatus.Forbidden => new ObjectResult(new { error = result.Error })
+            {
+                StatusCode = StatusCodes.Status403Forbidden
+            },
             ResultStatus.Invalid => new BadRequestObjectResult(
                 new ValidationProblemDetails(
                     result.ValidationErrors!.ToDictionary(e => e.Key, e => e.Value))),

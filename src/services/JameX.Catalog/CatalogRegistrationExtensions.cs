@@ -15,6 +15,17 @@ public static class CatalogRegistrationExtensions
     {
         services.AddScoped<IVideoRepository, VideoRepository>();
         services.AddScoped<IVideoQueryService, VideoQueryService>();
+        services.AddScoped<IVideoWriteService, VideoWriteService>();
+
+        // All three share the same scoped CatalogDbContext, which is what lets
+        // a business change, its outbox row and its inbox claim commit as one
+        // transaction rather than three.
+        services.AddScoped<IUnitOfWork, UnitOfWork<CatalogDbContext>>();
+        services.AddScoped<IOutbox, Outbox<CatalogDbContext>>();
+
+        // The relay that drains outbox_messages to SNS. Safe to run on every
+        // replica — it claims rows with FOR UPDATE SKIP LOCKED.
+        services.AddHostedService<OutboxDispatcher<CatalogDbContext>>();
 
         // Redis is registered by ServiceDefaults only when a connection string
         // is present. Resolving it here rather than demanding it lets the

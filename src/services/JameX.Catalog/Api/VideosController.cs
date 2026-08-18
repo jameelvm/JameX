@@ -3,6 +3,7 @@ using JameX.Catalog.Services;
 using JameX.Catalog.Validation;
 using JameX.Contracts.Dtos;
 using JameX.ServiceDefaults.Application;
+using JameX.ServiceDefaults.Hosting;
 using Microsoft.AspNetCore.Mvc;
 
 namespace JameX.Catalog.Api;
@@ -15,7 +16,10 @@ namespace JameX.Catalog.Api;
 [ApiController]
 [Route("videos")]
 [Produces("application/json")]
-public sealed class VideosController(IVideoQueryService videoQueryService) : ControllerBase
+public sealed class VideosController(
+    IVideoQueryService videoQueryService,
+    IVideoWriteService videoWriteService,
+    ICurrentUser currentUser) : ControllerBase
 {
     /// <summary>Header mirroring the nginx edge tier, so a cache hit is visible end to end.</summary>
     private const string CacheHeader = "X-JameX-Cache";
@@ -73,4 +77,32 @@ public sealed class VideosController(IVideoQueryService videoQueryService) : Con
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> GetBatch(BatchLookupRequest request, CancellationToken ct) =>
         (await videoQueryService.GetBatchAsync(request.Ids, ct)).ToActionResult();
+
+    /// <summary>
+    /// Updates editable metadata. PATCH, not PUT — omitted fields are left
+    /// alone rather than cleared.
+    /// </summary>
+    [HttpPatch("{videoId:guid}")]
+    [ProducesResponseType<VideoDetail>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> Update(
+        Guid videoId, UpdateVideoRequest request, CancellationToken ct) =>
+        (await videoWriteService.UpdateAsync(videoId, currentUser.RequireUserId(), request, ct))
+            .ToActionResult();
+
+    /// <summary>
+    /// Deletes the video and queues <c>VideoDeleted</c> in the outbox, both in
+    /// one transaction.
+    /// </summary>
+    [HttpDelete("{videoId:guid}")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> Delete(Guid videoId, CancellationToken ct) =>
+        (await videoWriteService.DeleteAsync(videoId, currentUser.RequireUserId(), ct))
+            .ToActionResult(_ => NoContent());
 }

@@ -10,8 +10,10 @@ component that document describes has a real, runnable counterpart here.
 **Stack:** .NET 10 · PostgreSQL · DynamoDB · S3 · SQS · SNS · Redis · FFmpeg ·
 YARP · Next.js · Docker Compose + LocalStack
 
-**Build status:** phases 1–2 complete and verified. Infrastructure and the
-service skeleton run; upload and playback arrive in phases 3–4.
+**Build status:** phases 1–3 complete and verified. Infrastructure, the service
+skeleton, and the Identity and Catalog services all run — including the inbox
+and outbox patterns that make the event bus safe. Upload and playback arrive in
+phase 4.
 
 ---
 
@@ -24,9 +26,10 @@ service skeleton run; upload and playback arrive in phases 3–4.
 5. [Getting it running](#5-getting-it-running)
 6. [Phase 1 — the local AWS environment](#6-phase-1--the-local-aws-environment)
 7. [Phase 2 — the service architecture](#7-phase-2--the-service-architecture)
-8. [Verification](#8-verification)
-9. [Interview talking points](#9-interview-talking-points)
-10. [Roadmap](#10-roadmap)
+8. [Phase 3 — Identity and Catalog](#8-phase-3--identity-and-catalog)
+9. [Verification](#9-verification)
+10. [Interview talking points](#10-interview-talking-points)
+11. [Roadmap](#11-roadmap)
 
 ---
 
@@ -285,6 +288,7 @@ Being able to state the cost matters as much as the benefit:
 ```
 App/
 ├── README.md            ← this file: end-to-end documentation
+├── TABLES-WALKTHROUGH.md ← plain-language tour of the Catalog tables
 ├── CLAUDE.md            ← project context and conventions
 ├── PROGRESS.md          ← live build state; what is next
 ├── JameX.slnx           ← .NET 10 XML solution format
@@ -305,9 +309,27 @@ App/
 └── web/                 Next.js frontend (phase 6)
 ```
 
+Inside a service that owns data, the folders name one concern each:
+
+```
+JameX.Catalog/
+├── Api/            controllers — routing and status codes only
+├── Services/       application logic — returns OperationResult<T>, no HTTP
+├── Repositories/   data access — EF and Npgsql stop here; never saves
+├── Domain/         entities
+├── EventHandlers/  one per subscribed event type
+├── Caching/        cache-aside over Redis
+├── Contracts/      inbound request records (private to this service)
+├── Mapping/        entity → DTO, and object key → CDN URL
+├── Validation/     input rules and limits
+└── Data/           DbContext, design-time factory, Migrations/
+```
+
 `JameX.Contracts` holds **only what crosses a service boundary** — event schemas
 and public DTOs. Entities stay private to their owning service. If a type is in
-Contracts, changing it is a breaking change to somebody else.
+Contracts, changing it is a breaking change to somebody else. Note the
+distinction from a service's own `Contracts/` folder, which is inbound-only and
+private.
 
 ---
 
@@ -855,7 +877,447 @@ shutting down.
 
 ---
 
-## 8. Verification
+## 8. Phase 3 — Identity and Catalog
+
+Phases 1 and 2 built infrastructure. Nothing did any work: seven services
+answered `/health/live` and four consumers sat on empty queues.
+
+Phase 3 makes two of them real. Identity owns accounts and channels; Catalog
+owns video metadata and reacts to the events that describe a video's life. It is
+also where the two patterns that make an at-least-once event bus survivable get
+built for real — the **inbox** and the **outbox**.
+
+### 8.1 What exists now
+
+| | Identity | Catalog |
+|---|---|---|
+| Database | `jamex_users` | `jamex_catalog` |
+| Tables | `users`, `channels` | `videos`, `renditions`, `processed_events`, `outbox_messages` |
+| Endpoints | 8 | 6 |
+| Event handlers | — | 3 |
+| Publishes | — | `VideoDeleted`, via the outbox |
+| Cache | — | Redis, on the watch page |
+
+### 8.2 The layering inside a service
+
+Every service is built in four layers, and the rule is that each one knows
+nothing about the layer above it:
+
+```
+Api/            controllers — routing and status codes ONLY
+  ↓
+Services/       application logic — returns OperationResult<T>, never touches HTTP
+  ↓
+Repositories/   data access — intention-revealing; EF and Npgsql stop here
+  ↓
+Domain/         entities
+```
+
+Supporting folders: `Contracts/` (inbound request records), `Mapping/`,
+`Validation/`, `Caching/`, `Data/`, `EventHandlers/`.
+
+A controller action is one expression:
+
+```csharp
+[HttpPost]
+public async Task<IActionResult> Create(CreateUserRequest request, CancellationToken ct) =>
+    (await userService.CreateAsync(request, ct))
+        .ToActionResult(user => Created($"/users/{user.UserId}", user));
+```
+
+**Why the service layer returns `OperationResult<T>` and not `IActionResult`.**
+The same method has to be callable from an event handler, a background job or a
+test with no `HttpContext` in sight. A service that returns `Results.Conflict()`
+has quietly become an HTTP endpoint with extra steps. So it reports an *outcome*
+— `Success` / `NotFound` / `Conflict` / `Invalid` / `Forbidden` — and one shared
+extension maps that to a status code. That mapping living in exactly one place
+is what stops two endpoints disagreeing about whether a situation is 400 or 404.
+
+Exceptions were deliberately not used for this. A missing video is not
+exceptional; it is Tuesday.
+
+**Why repositories are not generic.** There is no `IRepository<T>` with
+`Find(predicate)`. A generic repository over EF Core re-wraps `DbSet<T>` in a
+worse `DbSet<T>`, and letting `IQueryable` escape through it lets callers
+compose arbitrary queries — exactly the coupling the abstraction was meant to
+prevent. Instead every method names a question the application actually asks
+(`GetByHandleAsync`, `GetPublicFeedAsync`, `GetRenditionLabelsAsync`), and each
+one corresponds to an index on the table.
+
+**Repositories never call `SaveChangesAsync`.** That belongs to
+`IUnitOfWork` / `IInboxUnitOfWork`, because the whole point of the inbox and
+outbox is that a business change and its bookkeeping row commit *together*. A
+repository that saved on its own would split one transaction into two and
+destroy the guarantee.
+
+The layering earned its keep immediately: the transport was swapped from minimal
+APIs to MVC controllers mid-phase, and the service, repository and domain layers
+did not change by a single line. Only two controller files and one mapping
+method moved.
+
+### 8.3 Identity — the store that is not allowed to lag
+
+Chapter 2 puts user data in the strongly-consistent half of the design while
+video metadata is allowed to be eventually consistent. That one sentence is the
+entire reason Identity is a separate service with a separate database: each
+store gets tuned for its own consistency requirement instead of the strictest
+one being imposed on everything.
+
+**UUIDv7 primary keys**, via `Guid.CreateVersion7()`. Both v4 and v7 are unique;
+v7 embeds a timestamp in its high bits so successive ids sort in creation order.
+As a primary key that means inserts land at the right-hand edge of the B-tree
+instead of scattering across every page — far fewer page splits and a far better
+cache hit rate on a table that only grows.
+
+**Uniqueness lives in the index, not in code.** The tempting version is:
+
+```csharp
+if (await db.Users.AnyAsync(u => u.Email == email)) return Conflict();   // WRONG
+```
+
+That is a race. Two concurrent registrations both read "absent" and both insert;
+the index rejects one of them anyway, but now it surfaces as an unhandled 500
+instead of a 409. So the write is simply attempted, and SQLSTATE `23505` is
+translated into a conflict:
+
+```csharp
+catch (DbUpdateException exception) when (exception.IsUniqueViolation(out _))
+{
+    db.Entry(user).State = EntityState.Detached;   // do not retry a doomed insert
+    return false;
+}
+```
+
+Correct, and one round trip cheaper.
+
+**Batch endpoints exist for the Gateway.** `POST /users/batch` and
+`POST /channels/batch` take up to 100 ids and answer in one query:
+
+```sql
+SELECT u.id, u.created_at, u.display_name, u.email FROM users AS u WHERE u.id = ANY (@ids)
+```
+
+A feed of fifty videos carries fifty channel ids. Without a batch route the
+Gateway makes fifty HTTP calls — the N+1 problem, except each "+1" is now a
+network round trip with its own latency and failure mode. Ids that do not exist
+are simply absent from the response rather than a 404: a partial answer is the
+useful answer, and one deleted account should not fail a whole page.
+
+**Handles are resolved exactly once.** `GET /channels/by-handle/{handle}` turns
+a public `@name` into an id. Handles are mutable, so nothing else in the system
+stores one as a reference — every service speaks `ChannelId` only, and the
+translation happens once, at the edge, when a URL arrives.
+
+### 8.4 Catalog — a row assembled from events
+
+The `videos` table has 27 columns, and they group by **which event writes them**:
+
+| Group | Columns | Written by |
+|---|---|---|
+| Identity | `id`, `channel_id`, `uploader_id` | `VideoUploaded` |
+| Metadata | `title`, `description`, `tags`, `privacy`, `status` | `VideoUploaded`, then the API |
+| Upload facts | `raw_bucket`, `raw_object_key`, `size_bytes` | `VideoUploaded` |
+| Playback facts | `master_playlist_key`, `duration_seconds`, … | `VideoEncoded` |
+| Failure facts | `failure_reason`, `failure_stage`, `attempt_count` | `VideoEncodingFailed` |
+
+The playback columns are **nullable by design**. Between upload and encode
+completion a video genuinely has no duration and no master playlist, and the
+schema should not pretend otherwise.
+
+**`videos.id` is `ValueGeneratedNever()`.** Ingest mints the id before the bytes
+finish arriving so the client can poll for progress, and the raw S3 object key
+already embeds it. Catalog uses the id it is given; minting a second one would
+orphan the file.
+
+**The foreign-key contrast is the ownership rule made physical:**
+
+| Reference | Foreign key? | Why |
+|---|---|---|
+| `renditions.video_id` → `videos.id` | ✅ yes, cascade | same database, owned by this service |
+| `videos.channel_id` → `channels.id` | ❌ **impossible** | different database, owned by Identity |
+
+The database can no longer refuse a video whose channel does not exist. The
+service has to. That is the real cost of decomposition, and it is paid here in
+exchange for Identity and Catalog scaling independently.
+
+**Six indexes, each earning its place** — verified with `EXPLAIN`:
+
+```sql
+tags @> ARRAY['systemdesign']     → Bitmap Index Scan on ix_videos_tags        (GIN)
+title ILIKE '%youtube%'           → Bitmap Index Scan on ix_videos_title_trgm  (trigram)
+privacy=2 AND status=3 ORDER BY   → Index Scan using ix_videos_published       (partial)
+```
+
+The partial index is the most interesting. Its filter is
+`WHERE privacy = 2 AND status = 3`, so the plan has **no filter and no recheck**
+— every private, queued, transcoding and failed video is absent from the index
+entirely rather than being scanned and discarded.
+
+`tags` is a Postgres `text[]`, not a join table: tags are read with the video on
+every request and never queried independently of it, so the join a separate
+table would force on every read buys nothing — and GIN still answers "videos
+tagged X" quickly.
+
+### 8.5 A video's life, event by event
+
+The clearest way to understand the schema is to follow one video. Ids are
+shortened here for reading.
+
+> For the long-form version — full event payloads, every column with a "where it
+> came from" note, and the crash sequences that motivate the inbox and outbox —
+> see **[`TABLES-WALKTHROUGH.md`](TABLES-WALKTHROUGH.md)**.
+
+**Step 1 — Ingest announces a completed upload.**
+
+```json
+{ "eventId": "aaaa1111-…", "eventType": "VideoUploaded", "source": "Ingest",
+  "data": { "videoId": "019fff10-…", "channelId": "019ffe64-…",
+            "title": "How to Cook Pasta", "tags": ["cooking","pasta"],
+            "privacy": 2, "rawObjectKey": "uploads/019fff10…/source.mp4" } }
+```
+
+Catalog's handler writes **two rows in one transaction** — the video, and the
+inbox record saying it handled this message:
+
+```
+videos:            status=1 (Queued), privacy=2 (Public)
+                   duration_seconds=NULL, master_playlist_key=NULL, published_at=NULL
+processed_events:  event_id=aaaa1111-…
+```
+
+Eleven columns are NULL. That is not missing data — it is honest data. And
+`published_at` is NULL *even though the video is public*, because "public" is
+the uploader's intent while "published" means a viewer can actually press play.
+
+**Step 2 — Encoder announces the ladder.**
+
+```json
+{ "eventId": "bbbb2222-…", "eventType": "VideoEncoded", "source": "Encoder",
+  "data": { "videoId": "019fff10-…", "durationSeconds": 612.5,
+            "masterPlaylistKey": "videos/019fff10…/master.m3u8",
+            "renditions": [ { "label": "360p", … }, { "label": "720p", … }, { "label": "1080p", … } ] } }
+```
+
+Five writes, one transaction: the video is updated, three `renditions` rows are
+inserted, and a second inbox row is written.
+
+```
+videos:      status=3 (Ready), duration_seconds=612.5,
+             master_playlist_key set, published_at STAMPED NOW
+renditions:  360p, 720p, 1080p
+```
+
+The moment `published_at` is set, the video enters the public feed — because the
+partial index only holds rows that are both public and Ready.
+
+**Step 3 — or it fails instead.**
+
+```
+videos:  status=4 (Failed), failure_reason='No audio track found in source file',
+         failure_stage='probe', attempt_count=3, published_at STILL NULL
+```
+
+Those three failure columns are why the uploader sees a real error rather than a
+spinner that never stops.
+
+**Step 4 — the uploader deletes it.**
+
+Two writes, one transaction: the video row is deleted (its renditions cascade
+away), and a `VideoDeleted` event is written to `outbox_messages` with
+`published_at = NULL`. A background relay sends it moments later.
+
+### 8.6 The inbox — surviving at-least-once delivery
+
+SQS guarantees each message is delivered **at least once**, never exactly once.
+A message arrives twice when a handler runs longer than the visibility timeout,
+when it succeeds but crashes before deleting the message, or when someone
+redrives a dead-letter queue.
+
+Some work is naturally safe to repeat — `status = Ready` applied twice is still
+Ready. Some is not: `attempt_count + 1` twice, a comment inserted twice, or a
+view counter incremented twice. The counter case is the dangerous one, because
+nothing errors and nothing alerts — the number is simply wrong forever.
+
+`processed_events` is four columns, and the **primary key is the whole
+mechanism**:
+
+```csharp
+inbox.ClaimEvent(envelope);              // stages an INSERT into processed_events
+video.Status = VideoStatus.Ready;        // stages the actual work
+await inbox.TrySaveAsync(ct);            // ONE transaction — both, or neither
+```
+
+A redelivery tries to insert a duplicate primary key, the whole transaction
+rolls back, and `TrySaveAsync` returns `false`. The handler treats that as
+success and deletes the message.
+
+**Why it must be in the same database.** A Redis-based check is a *separate*
+system, so this can happen:
+
+```
+1. Redis: mark event as seen   ✅
+2. …crash…
+3. Postgres: apply the change   ❌ never ran
+```
+
+The event is now marked handled but the work never happened, and the retry gets
+skipped. That converts "might run twice" into "might never run", which is
+strictly worse. `RedisEventDeduplicator` still exists and is documented as a
+best-effort filter for services with no relational store — Search and Encoder.
+Catalog deliberately does not use it.
+
+**Verified**: five messages sent to Catalog's queue — an upload, a duplicate
+upload, an encode, a duplicate encode, and a replay of the encode under a new
+event id. Result: `videos = 1`, `renditions = 3` (each label exactly once),
+`processed_events = 3`. Both duplicates were rejected; the genuine replay was
+applied but added no rows.
+
+**Ordering is solved by retrying, not by sequencing.** If `VideoEncoded` is
+processed before `VideoUploaded` — which happens, because a batch is processed
+in parallel — the handler throws:
+
+```
+fail: Video 019fff20-… is not in the catalogue yet; retrying until VideoUploaded is applied.
+      (receive #1); leaving it for retry
+```
+
+No row was written, and critically **no inbox claim survived either** — proof
+that the rollback covers both writes. The message becomes visible again after
+the visibility timeout, by which time the upload has landed.
+
+**Ready always wins.** A late `VideoEncodingFailed` for a video that already
+succeeded is ignored, because the encoder retries and the two results can arrive
+out of order:
+
+```
+warn: Ignoring encoding failure for 019fff10-… — it is already Ready.
+```
+
+### 8.7 The outbox — closing the dual-write hole
+
+Phase 2's README listed this as an unfixed weakness. It is now fixed.
+
+The problem: committing a change and *then* publishing an event is two writes to
+two systems with no transaction spanning them.
+
+```
+1. DELETE the video      → committed to Postgres ✅
+2. …crash…
+3. publish VideoDeleted  → never happens          ❌
+```
+
+The video is gone from Catalog, but Search lists it forever and Engagement keeps
+its counters. Nothing can detect the drift.
+
+The fix is to make step 2 part of step 1:
+
+```csharp
+videos.Remove(video);
+outbox.Enqueue(EventTypes.VideoDeleted, new VideoDeleted(videoId, channelId, DateTimeOffset.UtcNow));
+await unitOfWork.SaveChangesAsync(ct);   // ← one transaction
+```
+
+Caught mid-flight in testing, immediately after `DELETE` returned 204:
+
+```
+ video_rows | rendition_rows | outbox_rows
+      0     |       0        |      1        ← published_at NULL
+```
+
+The video is gone, its renditions cascaded, and the announcement is durable but
+unsent.
+
+**The event id is minted once, at write time, and stored.** The relay publishes
+those exact bytes — which is why `IEventPublisher` grew a
+`PublishEnvelopeAsync` that does *not* build a new envelope. If it did, a retry
+would carry a fresh `EventId`, every consumer's inbox would treat the resend as
+a brand-new event, and the change would be applied twice with nothing able to
+detect it. **A stable `EventId` is the link between the outbox and the inbox.**
+
+**The relay claims rows with `FOR UPDATE SKIP LOCKED`:**
+
+```sql
+SELECT * FROM outbox_messages
+WHERE published_at IS NULL AND attempt_count < 10
+ORDER BY id LIMIT 20
+FOR UPDATE SKIP LOCKED
+```
+
+This is what makes the dispatcher safe to run on every replica at once — each
+locks the rows it takes and the others step *over* them rather than blocking.
+Without it, three replicas publish the same batch three times.
+
+**This is where `EnableRetryOnFailure` finally bites.** It installs an execution
+strategy, and any code opening its own transaction must run through it — because
+a retry has to replay the whole transaction, not resume it halfway:
+
+```csharp
+var strategy = db.Database.CreateExecutionStrategy();
+return await strategy.ExecuteAsync(async () => { … BeginTransactionAsync … });
+```
+
+The trade the outbox makes is worth stating plainly: it converts *"the event
+might vanish forever"* into *"the event might arrive twice"*. The first is
+unfixable data corruption. The second is what the inbox already handles.
+
+### 8.8 Cache-aside on the watch page
+
+One video is watched by thousands of people, so `GET /videos/{id}` is cached in
+Redis — the doc's Memcached tier.
+
+```
+1. Ask Redis           → hit? return, Postgres untouched
+2. Miss → ask Postgres → not found? 404
+3. Populate the cache  → only if status = Ready
+4. Return
+```
+
+**Only settled rows are cached.** A `Queued` video changes again within minutes;
+caching it just guarantees someone sees a stale watch page.
+
+**Invalidate by delete, never overwrite, and always after the commit.**
+Overwriting races — two concurrent updates can reach Redis in the opposite order
+to Postgres, leaving the cache permanently wrong. Invalidating *before* the
+commit leaves a window where a reader repopulates from the old row. Deleting
+after means the worst case is one extra database read.
+
+**Feeds are deliberately not cached.** A feed page has no precise invalidation
+key: publishing one video shifts the contents of every page after it, so correct
+invalidation would mean dropping the entire feed on every publish. The rule
+applied throughout is:
+
+> Cache something only if you can name exactly which entry to delete when it
+> changes.
+
+Redis is capped at 256 MB with `allkeys-lru`, so the cache never needs a policy
+for *which* videos to keep — least-recently-used discovers real popularity from
+traffic. A 5-minute TTL bounds the damage from any missed invalidation.
+
+The service also runs correctly with **no Redis at all**: `NullVideoCache` is
+registered when no connection string is present, and every Redis call is wrapped
+so a fault degrades to a database read. Losing a cache must cost latency, never
+availability.
+
+### 8.9 What phase 3 does not do
+
+- **Nothing publishes `VideoUploaded`, `VideoEncoded` or `VideoEncodingFailed`
+  yet.** Those come from Ingest and Encoder in phase 4. Phase 3's handlers were
+  tested by publishing the events by hand — which is the point of an event bus:
+  Catalog has no idea who produced the message.
+- **Authorisation is uploader-only.** Catalog can check `uploader_id` because it
+  owns that column, but it genuinely cannot verify channel ownership — that
+  fact lives in Identity. In production the Gateway would resolve it once and
+  forward a signed claim.
+- **Engagement counts are zeros.** `VideoDetail.ChannelName`, `Counts` and
+  `ViewerReaction` are left empty by Catalog on purpose; the Gateway overlays
+  them from Identity and Engagement. Guessing them here would mean reading
+  another service's data.
+- **No optimistic concurrency yet.** Postgres' `xmin` works as a concurrency
+  token with no schema change, so adding it later costs nothing.
+
+---
+
+## 9. Verification
 
 Everything below was run and passed on 2026-08-07.
 
@@ -933,9 +1395,101 @@ curl -sI http://localhost:8090/media/probe/t.m3u8 | grep X-JameX-Cache   # MISS
 curl -sI http://localhost:8090/media/probe/t.m3u8 | grep X-JameX-Cache   # HIT
 ```
 
+### Phase 3 — Identity and Catalog
+
+```bash
+# --- Identity -------------------------------------------------------------
+# Register, and prove the unique index rejects a case-different duplicate
+curl -s -X POST localhost:8081/users -H 'Content-Type: application/json' \
+  -d '{"email":"Jameel@Example.COM","displayName":"Jameel"}'
+# → 201, email stored lower-cased
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8081/users \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"JAMEEL@example.com","displayName":"Impostor"}'
+# → 409
+
+USER=<the userId returned above>
+
+# Channel creation takes its owner from the caller, never the body
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8081/channels \
+  -H 'Content-Type: application/json' -d '{"name":"JameX","handle":"@JameX"}'
+# → 401  (no X-JameX-User header)
+
+curl -s -X POST localhost:8081/channels -H 'Content-Type: application/json' \
+  -H "X-JameX-User: $USER" -d '{"name":"JameX Official","handle":"@JameX"}'
+# → 201, handle normalised to "jamex"
+
+# Handles resolve case-insensitively, with or without the @
+curl -s localhost:8081/channels/by-handle/@JaMeX
+
+# Batch lookup is ONE indexed query, and missing ids are simply absent
+curl -s -X POST localhost:8081/users/batch -H 'Content-Type: application/json' \
+  -d "{\"ids\":[\"$USER\",\"00000000-0000-0000-0000-0000000000ff\"]}"
+# → one user returned, no 404
+
+# --- Catalog: the event pipeline ------------------------------------------
+Q=$(docker exec jamex-localstack awslocal sqs get-queue-url \
+      --queue-name jamex-catalog-events --query QueueUrl --output text)
+
+send() {   # send() <file> <eventType>
+  docker exec jamex-localstack awslocal sqs send-message --queue-url "$Q" \
+    --message-body "file://$1" \
+    --message-attributes "{\"eventType\":{\"DataType\":\"String\",\"StringValue\":\"$2\"}}"
+}
+
+# Send an upload, the SAME upload again, an encode, the SAME encode again
+send /tmp/uploaded.json VideoUploaded
+send /tmp/uploaded.json VideoUploaded
+send /tmp/encoded.json  VideoEncoded
+send /tmp/encoded.json  VideoEncoded
+
+docker exec jamex-postgres psql -U jamex -d jamex_catalog -c \
+ "SELECT (SELECT count(*) FROM videos) videos,
+         (SELECT count(*) FROM renditions) renditions,
+         (SELECT count(*) FROM processed_events) inbox;"
+# → videos=1  renditions=3  inbox=2      ← both duplicates rejected by the inbox
+
+# --- Catalog: cache-aside -------------------------------------------------
+curl -sI localhost:8082/videos/$VIDEO | grep X-JameX-Cache   # MISS
+curl -sI localhost:8082/videos/$VIDEO | grep X-JameX-Cache   # HIT
+docker exec jamex-redis redis-cli KEYS 'jamex:catalog:video:*'
+docker exec jamex-redis redis-cli TTL  'jamex:catalog:video:<id>'   # → ~300
+
+# --- Catalog: the outbox --------------------------------------------------
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8082/videos/$VIDEO \
+  -H "X-JameX-User: $USER"
+# → 204
+
+# Immediately: the video is gone AND the announcement is durable but unsent
+docker exec jamex-postgres psql -U jamex -d jamex_catalog -c \
+ "SELECT (SELECT count(*) FROM videos) videos,
+         (SELECT count(*) FROM renditions) renditions,
+         (SELECT count(*) FROM outbox_messages WHERE published_at IS NULL) unsent;"
+# → videos=0  renditions=0  unsent=1     ← one transaction did all three
+
+# Within ~2s the relay drains it
+docker exec jamex-postgres psql -U jamex -d jamex_catalog -c \
+ "SELECT event_type, published_at, attempt_count FROM outbox_messages;"
+# → VideoDeleted | 2026-… | 0
+```
+
+**Known local flakiness.** LocalStack's SNS→SQS fan-out is unreliable under
+rapid repeated publishes — messages are sometimes delivered minutes late or
+dropped. Two consequences worth knowing:
+
+- Prefer `sqs send-message` directly to a queue when testing a *handler*; it
+  removes SNS from the equation and tests exactly the code you care about.
+- **Never run `sqs purge-queue`.** AWS documents that messages sent within ~60s
+  of a purge may be deleted mid-purge; in LocalStack the queue did not recover
+  at all and needed a container restart.
+
+Also note that redirecting a service's stdout to a file block-buffers the log,
+so `dotnet run > app.log` lags badly and only flushes on exit. **The database is
+the reliable source of truth when verifying handlers.**
+
 ---
 
-## 9. Interview talking points
+## 10. Interview talking points
 
 Rehearse these aloud. Each is answerable from what is actually built.
 
@@ -979,11 +1533,56 @@ timeout, because a huge timeout also delays recovery when a consumer dies.
 
 **"You commit to your database and then publish an event. What if you crash in
 between?"**
-That is the dual-write problem, and it currently exists in this build. The event
-is lost and the system is permanently inconsistent. The fix is the transactional
-outbox: write the event into an `outbox` table in the same transaction as the
-business change, then relay it to SNS from a separate process. The relay is
-at-least-once, which is fine because consumers are idempotent.
+That is the dual-write problem, and it is solved here with the transactional
+outbox. The event is written to `outbox_messages` inside the same transaction as
+the business change, so the intention to publish is exactly as durable as the
+change itself. A background relay drains unsent rows to SNS and stamps
+`published_at`. It converts "the event might vanish forever" into "the event
+might arrive twice" — and the second is already handled by the consumer's inbox.
+
+**"How do you make an at-least-once consumer safe?"**
+The inbox pattern. The handler inserts the event id into a `processed_events`
+table in the *same transaction* as the change it applies, and the primary key
+rejects redeliveries. The check and the effect commit or roll back together, so
+there is no window where one happened without the other. A cache-based check
+cannot do this — Redis is a separate system, so marking an event seen and then
+crashing before the change commits turns "runs twice" into "never runs", which
+is worse.
+
+**"Two replicas both run your outbox relay. Don't they publish everything
+twice?"**
+No — the relay claims rows with `SELECT … FOR UPDATE SKIP LOCKED`. Each replica
+locks the batch it takes and the others step over those rows instead of blocking
+on them. That is also why the event id is generated once at write time and
+stored: if the relay rebuilt the envelope per attempt, a retry would carry a new
+id and every consumer's inbox would treat it as a new event.
+
+**"An event arrives before the one it depends on. How do you order them?"**
+Usually you don't. `VideoEncoded` for a video Catalog has not created yet simply
+throws; the message is left undeleted, becomes visible again after the
+visibility timeout, and succeeds once the upload event has landed. The queue's
+retry becomes the sequencing mechanism, and the visibility timeout becomes the
+back-off. Because the inbox claim rolls back with the failed work, the aborted
+attempt leaves nothing behind to block the successful one.
+
+**"What do you cache, and how do you invalidate it?"**
+Cache-aside on the watch page only, keyed by video id, deleted (never
+overwritten) after the write commits, with a 5-minute TTL so a missed
+invalidation self-heals. Feeds are not cached, because publishing one video
+shifts every page after it — there is no precise invalidation key. The rule is:
+cache something only if you can name exactly which entry to delete when it
+changes. Redis runs `allkeys-lru` under a memory cap, so popularity is
+discovered from traffic rather than declared by a policy.
+
+**"Do you use the repository pattern with EF Core?"**
+`DbContext` is already a unit of work and `DbSet` is already a repository, so a
+generic `IRepository<T>` wrapper adds nothing and leaks `IQueryable`. What earns
+its place is a narrow, intention-revealing interface per aggregate: it names the
+queries the application actually makes, keeps provider exceptions like SQLSTATE
+`23505` from leaking upward, and makes the service layer testable without a
+database. Critically, the repositories here never call `SaveChangesAsync` —
+committing belongs to the unit of work, because the change and its inbox or
+outbox row must land in one transaction.
 
 **"Strong or eventual consistency?"**
 Both, split by data class. Eventual for video metadata and counts, because a few
@@ -1022,20 +1621,21 @@ handle.
 
 ---
 
-## 10. Roadmap
+## 11. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | **1** | Local AWS substrate: S3, SQS, DynamoDB, Postgres split, Redis, edge cache | ✅ **Done, verified** |
 | **2** | Service decomposition, contracts, SNS/SQS event bus, gateway, shared plumbing | ✅ **Done, verified** |
-| 3 | Identity + Catalog: EF Core models, migrations, REST APIs, event handlers | ⬜ Next |
-| 4 | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ⬜ |
+| **3** | Identity + Catalog: EF Core models, migrations, REST APIs, event handlers, inbox + outbox, cache-aside | ✅ **Done, verified** |
+| 4 | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ⬜ Next |
 | 5 | Engagement + Search: sharded counters, reactions, comments, inverted index | ⬜ |
 | 6 | Gateway BFF aggregation + Next.js frontend with hls.js adaptive player | ⬜ |
 | 7 | `DESIGN.md` — doc-to-code mapping and interview question bank | ⬜ |
 
-Stretch goals once the pipeline is end to end: transactional outbox for Catalog,
-per-shot encoding (chapter 5), duplicate detection via perceptual hashing / LSH
-(chapter 4), and the two-stage candidate-generation-plus-ranking recommender.
+Stretch goals once the pipeline is end to end: per-shot encoding (chapter 5),
+duplicate detection via perceptual hashing / LSH (chapter 4), optimistic
+concurrency via Postgres `xmin`, and the two-stage
+candidate-generation-plus-ranking recommender.
 
 `PROGRESS.md` holds the live build state and is updated every session.

@@ -16,6 +16,17 @@ public interface IEventPublisher
     /// <c>eventType</c> message attribute so subscription filter policies can
     /// route it to only the queues that care.</param>
     Task PublishAsync<T>(string eventType, T data, CancellationToken ct = default);
+
+    /// <summary>
+    /// Publishes an envelope that has already been built and serialised —
+    /// the outbox relay's path.
+    /// <para>
+    /// It must not construct a new envelope, because the stored one carries the
+    /// <c>EventId</c> that consumers deduplicate on. Regenerating it on a retry
+    /// would make every resend look like a new event.
+    /// </para>
+    /// </summary>
+    Task PublishEnvelopeAsync(string eventType, string envelopeJson, CancellationToken ct = default);
 }
 
 public sealed class SnsEventPublisher : IEventPublisher
@@ -43,18 +54,24 @@ public sealed class SnsEventPublisher : IEventPublisher
     public async Task PublishAsync<T>(string eventType, T data, CancellationToken ct = default)
     {
         var envelope = new EventEnvelope<T>(
-            EventId: Guid.NewGuid(),
+            EventId: Guid.CreateVersion7(),
             EventType: eventType,
             OccurredAt: DateTimeOffset.UtcNow,
             Source: _source,
             Data: data);
 
+        await PublishEnvelopeAsync(eventType, JameXJson.Serialize(envelope), ct);
+    }
+
+    public async Task PublishEnvelopeAsync(
+        string eventType, string envelopeJson, CancellationToken ct = default)
+    {
         var topicArn = await ResolveTopicArnAsync(ct);
 
         var request = new PublishRequest
         {
             TopicArn = topicArn,
-            Message = JameXJson.Serialize(envelope),
+            Message = envelopeJson,
             MessageAttributes = new Dictionary<string, MessageAttributeValue>
             {
                 // Filter policies on each subscription match on this attribute.
@@ -67,9 +84,7 @@ public sealed class SnsEventPublisher : IEventPublisher
 
         await _sns.PublishAsync(request, ct);
 
-        _logger.LogInformation(
-            "Published {EventType} {EventId} from {Source}",
-            eventType, envelope.EventId, _source);
+        _logger.LogInformation("Published {EventType} from {Source}", eventType, _source);
     }
 
     /// <summary>

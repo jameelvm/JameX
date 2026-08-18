@@ -48,6 +48,13 @@ public interface IVideoRepository
 
     void Add(Video video);
 
+    /// <summary>
+    /// Stages a delete. The video's renditions go with it via the cascade on
+    /// the foreign key — no explicit cleanup, because both tables are in this
+    /// service's own database.
+    /// </summary>
+    void Remove(Video video);
+
     void AddRenditions(IEnumerable<Rendition> renditions);
 
     /// <summary>
@@ -128,6 +135,8 @@ internal sealed class VideoRepository(CatalogDbContext db) : IVideoRepository
     }
 
     public void Add(Video video) => db.Videos.Add(video);
+
+    public void Remove(Video video) => db.Videos.Remove(video);
 
     public void AddRenditions(IEnumerable<Rendition> renditions) =>
         db.Renditions.AddRange(renditions);
