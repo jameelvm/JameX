@@ -1,3 +1,4 @@
+using JameX.Catalog.Caching;
 using JameX.Catalog.Repositories;
 using JameX.Contracts;
 using JameX.Contracts.Events;
@@ -19,6 +20,7 @@ namespace JameX.Catalog.EventHandlers;
 public sealed class VideoEncodingFailedHandler(
     IVideoRepository videos,
     IInboxUnitOfWork inbox,
+    IVideoCache cache,
     ILogger<VideoEncodingFailedHandler> logger)
     : EventHandlerBase<VideoEncodingFailed>(logger)
 {
@@ -68,6 +70,9 @@ public sealed class VideoEncodingFailedHandler(
 
         if (await inbox.TrySaveAsync(ct))
         {
+            // After the commit — same reasoning as VideoEncodedHandler.
+            await cache.InvalidateAsync(data.VideoId, ct);
+
             Logger.LogWarning(
                 "Video {VideoId} failed encoding at stage {Stage} after {Attempts} attempts: {Reason}",
                 data.VideoId, data.Stage, data.AttemptCount, data.Reason);

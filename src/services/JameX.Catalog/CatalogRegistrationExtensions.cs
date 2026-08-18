@@ -1,8 +1,11 @@
+using JameX.Catalog.Caching;
 using JameX.Catalog.Data;
 using JameX.Catalog.EventHandlers;
 using JameX.Catalog.Repositories;
+using JameX.Catalog.Services;
 using JameX.ServiceDefaults.Data;
 using JameX.ServiceDefaults.Hosting;
+using StackExchange.Redis;
 
 namespace JameX.Catalog;
 
@@ -11,6 +14,25 @@ public static class CatalogRegistrationExtensions
     public static IServiceCollection AddCatalogServices(this IServiceCollection services)
     {
         services.AddScoped<IVideoRepository, VideoRepository>();
+        services.AddScoped<IVideoQueryService, VideoQueryService>();
+
+        // Redis is registered by ServiceDefaults only when a connection string
+        // is present. Resolving it here rather than demanding it lets the
+        // service start and serve correctly with no cache at all — losing the
+        // cache must cost latency, not availability.
+        services.AddScoped<IVideoCache>(provider =>
+        {
+            var redis = provider.GetService<IConnectionMultiplexer>();
+
+            if (redis is null)
+            {
+                provider.GetRequiredService<ILogger<NullVideoCache>>()
+                    .LogWarning("No Redis configured; Catalog reads will always hit Postgres");
+                return new NullVideoCache();
+            }
+
+            return new RedisVideoCache(redis, provider.GetRequiredService<ILogger<RedisVideoCache>>());
+        });
 
         // Bound to CatalogDbContext, so the inbox row and the business change
         // share one context and therefore one transaction.

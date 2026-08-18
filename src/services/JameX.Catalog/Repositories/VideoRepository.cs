@@ -1,5 +1,6 @@
 using JameX.Catalog.Data;
 using JameX.Catalog.Domain;
+using JameX.Contracts;
 using Microsoft.EntityFrameworkCore;
 
 namespace JameX.Catalog.Repositories;
@@ -26,6 +27,25 @@ public interface IVideoRepository
 
     Task<bool> ExistsAsync(Guid videoId, CancellationToken ct);
 
+    /// <summary>
+    /// The watch page read: one video with its ladder, for display only.
+    /// </summary>
+    Task<Video?> GetDetailAsync(Guid videoId, CancellationToken ct);
+
+    /// <summary>
+    /// The public feed — public and Ready only, newest published first.
+    /// Shaped to match ix_videos_published exactly.
+    /// </summary>
+    Task<(IReadOnlyList<Video> Items, int Total)> GetPublicFeedAsync(
+        int page, int pageSize, CancellationToken ct);
+
+    /// <summary>A channel's public videos, newest first.</summary>
+    Task<(IReadOnlyList<Video> Items, int Total)> GetByChannelAsync(
+        Guid channelId, int page, int pageSize, CancellationToken ct);
+
+    /// <summary>Batch resolution for the Gateway, mirroring Identity's endpoints.</summary>
+    Task<IReadOnlyList<Video>> GetManyAsync(IReadOnlyCollection<Guid> videoIds, CancellationToken ct);
+
     void Add(Video video);
 
     void AddRenditions(IEnumerable<Rendition> renditions);
@@ -45,6 +65,67 @@ internal sealed class VideoRepository(CatalogDbContext db) : IVideoRepository
 
     public Task<bool> ExistsAsync(Guid videoId, CancellationToken ct) =>
         db.Videos.AsNoTracking().AnyAsync(v => v.Id == videoId, ct);
+
+    // Include, because the watch page needs the ladder in the same round trip.
+    // AsNoTracking, because nothing here is going to be modified — and a
+    // tracked graph of video + renditions costs snapshots nobody will read.
+    public Task<Video?> GetDetailAsync(Guid videoId, CancellationToken ct) =>
+        db.Videos.AsNoTracking()
+            .Include(v => v.Renditions)
+            .FirstOrDefaultAsync(v => v.Id == videoId, ct);
+
+    public async Task<(IReadOnlyList<Video> Items, int Total)> GetPublicFeedAsync(
+        int page, int pageSize, CancellationToken ct)
+    {
+        // These two predicates are not arbitrary — they are the filter on
+        // ix_videos_published, so this query reads a small index containing
+        // only publishable rows rather than scanning the whole table.
+        var query = db.Videos.AsNoTracking()
+            .Where(v => v.Privacy == VideoPrivacy.Public && v.Status == VideoStatus.Ready);
+
+        var total = await query.CountAsync(ct);
+
+        var items = await query
+            .OrderByDescending(v => v.PublishedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return (items, total);
+    }
+
+    public async Task<(IReadOnlyList<Video> Items, int Total)> GetByChannelAsync(
+        Guid channelId, int page, int pageSize, CancellationToken ct)
+    {
+        // Ordered by CreatedAt to match ix_videos_channel_id_created_at, so the
+        // index satisfies the filter and the sort together.
+        var query = db.Videos.AsNoTracking()
+            .Where(v => v.ChannelId == channelId
+                        && v.Privacy == VideoPrivacy.Public
+                        && v.Status == VideoStatus.Ready);
+
+        var total = await query.CountAsync(ct);
+
+        var items = await query
+            .OrderByDescending(v => v.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return (items, total);
+    }
+
+    public async Task<IReadOnlyList<Video>> GetManyAsync(
+        IReadOnlyCollection<Guid> videoIds, CancellationToken ct)
+    {
+        if (videoIds.Count == 0) return [];
+
+        var ids = videoIds.Distinct().ToArray();
+
+        return await db.Videos.AsNoTracking()
+            .Where(v => ids.Contains(v.Id))
+            .ToListAsync(ct);
+    }
 
     public void Add(Video video) => db.Videos.Add(video);
 

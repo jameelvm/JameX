@@ -1,3 +1,4 @@
+using JameX.Catalog.Caching;
 using JameX.Catalog.Domain;
 using JameX.Catalog.Repositories;
 using JameX.Contracts;
@@ -19,6 +20,7 @@ namespace JameX.Catalog.EventHandlers;
 public sealed class VideoEncodedHandler(
     IVideoRepository videos,
     IInboxUnitOfWork inbox,
+    IVideoCache cache,
     ILogger<VideoEncodedHandler> logger)
     : EventHandlerBase<VideoEncoded>(logger)
 {
@@ -73,6 +75,11 @@ public sealed class VideoEncodedHandler(
 
         if (await inbox.TrySaveAsync(ct))
         {
+            // After the commit, never before. Invalidating first leaves a
+            // window where a reader repopulates the cache from the old row and
+            // the entry outlives the change it was meant to clear.
+            await cache.InvalidateAsync(data.VideoId, ct);
+
             Logger.LogInformation(
                 "Video {VideoId} is Ready — {Rungs} rungs, {Duration:F1}s, encoded by {Provider} in {Seconds:F1}s",
                 data.VideoId, data.Renditions.Length, data.DurationSeconds,
