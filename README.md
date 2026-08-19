@@ -288,6 +288,7 @@ Being able to state the cost matters as much as the benefit:
 ```
 App/
 ├── README.md            ← this file: end-to-end documentation
+├── DESIGN.md            ← system design summary + interview question bank
 ├── TABLES-WALKTHROUGH.md ← plain-language tour of the Catalog tables
 ├── CLAUDE.md            ← project context and conventions
 ├── PROGRESS.md          ← live build state; what is next
@@ -1492,6 +1493,10 @@ the reliable source of truth when verifying handlers.**
 ## 10. Interview talking points
 
 Rehearse these aloud. Each is answerable from what is actually built.
+
+> **[`DESIGN.md`](DESIGN.md)** holds the fuller version — the decision register,
+> a failure-mode table, and the question bank grouped by theme. Use this section
+> for a quick pass and `DESIGN.md` before an interview.
 
 **"How do you handle the write volume on view counts?"**
 Sharded counters in DynamoDB. One item per video is a hot partition capped near

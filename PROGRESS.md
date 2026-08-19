@@ -25,7 +25,11 @@ and *Next up* sections at the end of every session.
    documentation of what that phase built — architecture, each module, the
    reasoning behind each choice, verification commands and interview talking
    points. The README is revision material, not a change log.
-2. Every phase leaves `dotnet build JameX.slnx` green.
+2. Also extend `DESIGN.md` — the system design summary: new decisions in the
+   register, new rows in the failure-mode table, new questions in the bank, and
+   an updated coverage map.
+3. Every phase leaves `dotnet build JameX.slnx` green.
+4. Build in short modules, one concept each, pausing after every module.
 
 ---
 

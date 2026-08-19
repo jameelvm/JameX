@@ -12,6 +12,12 @@ the design doc has a real, runnable counterpart here.
 - **`README.md`** — end-to-end teaching documentation. **Update it at the end of
   every phase**, explaining what was built and why, with verification steps and
   interview talking points. It is revision material, not a change log.
+- **`DESIGN.md`** — the system design summary: decision register, failure-mode
+  table, interview question bank and coverage map. **Extend it at the end of
+  every phase.** README explains *how* it was built; DESIGN explains *why it is
+  shaped this way*.
+- **`TABLES-WALKTHROUGH.md`** — plain-language tour of the Catalog tables,
+  following one video through every event that writes it.
 
 ## Owner context
 
