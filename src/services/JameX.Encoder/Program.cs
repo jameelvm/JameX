@@ -1,3 +1,4 @@
+using JameX.Encoder;
 using JameX.ServiceDefaults.Hosting;
 
 // Encoder is the doc's encoder tier. It consumes VideoUploaded, transcodes to
@@ -11,10 +12,18 @@ const string ServiceName = "Encoder";
 var builder = WebApplication.CreateBuilder(args);
 
 builder.AddJameXServiceDefaults(ServiceName);
+
+// Encoder is a worker, but it still exposes HTTP — health probes, and in
+// Development a debug endpoint that runs the ladder over a generated clip so
+// the transcode path can be exercised without publishing an event.
+builder.AddJameXApiDefaults();
+
+builder.Services.AddEncoderServices(builder.Configuration);
 builder.Services.AddJameXEventConsumer();
 
 var app = builder.Build();
 
+app.UseJameXExceptionHandling();
 app.MapJameXDefaultEndpoints(ServiceName);
 
 app.Run();
