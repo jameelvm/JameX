@@ -25,6 +25,14 @@ public interface IUploadSessionRepository
     Task RecordPartAsync(Guid uploadId, int partNumber, string eTag, CancellationToken ct);
 
     Task SetStatusAsync(Guid uploadId, UploadStatus status, CancellationToken ct);
+
+    /// <summary>
+    /// Moves the session to Completed and stamps the event id that will be
+    /// published for it. Returns <c>false</c> if it was already completed — in
+    /// which case this is a retry, and the caller should reuse the stored id
+    /// rather than mint a new one.
+    /// </summary>
+    Task<bool> TryMarkCompletedAsync(Guid uploadId, Guid completionEventId, CancellationToken ct);
 }
 
 internal sealed class UploadSessionRepository(
@@ -116,6 +124,37 @@ internal sealed class UploadSessionRepository(
         }, ct);
     }
 
+    public async Task<bool> TryMarkCompletedAsync(
+        Guid uploadId, Guid completionEventId, CancellationToken ct)
+    {
+        try
+        {
+            await dynamo.UpdateItemAsync(new UpdateItemRequest
+            {
+                TableName = _table,
+                Key = Key(uploadId),
+                UpdateExpression = "SET #status = :completed, completionEventId = :eventId",
+                ExpressionAttributeNames = new Dictionary<string, string> { ["#status"] = "status" },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":completed"] = new() { N = ((int)UploadStatus.Completed).ToString() },
+                    [":eventId"] = new(completionEventId.ToString()),
+                    [":inProgress"] = new() { N = ((int)UploadStatus.InProgress).ToString() }
+                },
+                // Only the first completion wins. A concurrent or repeated call
+                // fails this condition, which is how the caller learns to reuse
+                // the already-stored event id instead of minting a second one.
+                ConditionExpression = "attribute_exists(uploadId) AND #status = :inProgress"
+            }, ct);
+
+            return true;
+        }
+        catch (ConditionalCheckFailedException)
+        {
+            return false;
+        }
+    }
+
     private static Dictionary<string, AttributeValue> Key(Guid uploadId) =>
         new() { ["uploadId"] = new(uploadId.ToString()) };
 
@@ -185,7 +224,8 @@ internal sealed class UploadSessionRepository(
         ExpiresAt = DateTimeOffset.FromUnixTimeSeconds(long.Parse(item["expiresAt"].N)),
         UploadedParts = item.TryGetValue("parts", out var p)
             ? p.M.ToDictionary(kv => int.Parse(kv.Key), kv => kv.Value.S)
-            : []
+            : [],
+        CompletionEventId = item.TryGetValue("completionEventId", out var e) ? Guid.Parse(e.S) : null
     };
 
     private static AttributeValue Number(long value) => new() { N = value.ToString() };

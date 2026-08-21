@@ -71,6 +71,23 @@ public sealed class UploadSession
 
     public UploadStatus Status { get; set; } = UploadStatus.InProgress;
 
+    /// <summary>
+    /// Event id assigned when the upload completes, and reused on every retry.
+    /// <para>
+    /// Ingest owns no relational store, so it cannot use the transactional
+    /// outbox Catalog uses. It marks the session complete and then publishes —
+    /// two writes, so a crash in between loses the event.
+    /// </para>
+    /// <para>
+    /// The mitigation is to make completion <b>safely repeatable</b>: the id is
+    /// stored with the status change, so a retried completion republishes the
+    /// <i>same</i> event id. Every consumer's inbox then recognises it as a
+    /// duplicate and ignores it. The window narrows from "lost forever" to
+    /// "published on the next attempt".
+    /// </para>
+    /// </summary>
+    public Guid? CompletionEventId { get; set; }
+
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 
     /// <summary>

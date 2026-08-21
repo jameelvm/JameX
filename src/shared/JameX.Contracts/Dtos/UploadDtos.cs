@@ -8,6 +8,12 @@ namespace JameX.Contracts.Dtos;
 /// presigned URLs and the browser writes straight to S3.
 /// </summary>
 public sealed record CreateUploadRequest(
+    /// <summary>
+    /// The publishing channel. Supplied by the client rather than inferred,
+    /// because a user may own several — but the *uploader* is never taken from
+    /// the body; it comes from the authenticated caller.
+    /// </summary>
+    Guid ChannelId,
     string Title,
     string? Description,
     string? CategoryId,

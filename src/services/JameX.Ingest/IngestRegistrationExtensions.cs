@@ -1,5 +1,7 @@
 using JameX.Ingest.Configuration;
 using JameX.Ingest.Repositories;
+using JameX.Ingest.Services;
+using JameX.Ingest.Storage;
 
 namespace JameX.Ingest;
 
@@ -13,6 +15,8 @@ public static class IngestRegistrationExtensions
         services.Configure<UploadOptions>(configuration.GetSection(UploadOptions.SectionName));
 
         services.AddScoped<IUploadSessionRepository, UploadSessionRepository>();
+        services.AddScoped<IRawUploadStore, RawUploadStore>();
+        services.AddScoped<IUploadService, UploadService>();
 
         return services;
     }
