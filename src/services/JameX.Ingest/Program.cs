@@ -1,3 +1,4 @@
+using JameX.Ingest;
 using JameX.ServiceDefaults.Hosting;
 
 // Ingest owns the upload path: presigned multipart URLs, resumable session
@@ -10,10 +11,13 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddJameXServiceDefaults(ServiceName);
 builder.AddJameXApiDefaults();
+builder.Services.AddIngestServices(builder.Configuration);
 
 var app = builder.Build();
 
+app.UseJameXExceptionHandling();
 app.UseCors();
+
 app.MapJameXDefaultEndpoints(ServiceName);
 
 app.Run();
