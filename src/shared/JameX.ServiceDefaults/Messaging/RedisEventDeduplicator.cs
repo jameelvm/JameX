@@ -20,6 +20,17 @@ namespace JameX.ServiceDefaults.Messaging;
 /// genuinely idempotent regardless.
 /// </para>
 /// </summary>
+/// <summary>
+/// Used when no Redis is configured. Treats every event as new, which is safe
+/// because handlers must be idempotent anyway — the deduplicator is an
+/// optimisation, never the guarantee.
+/// </summary>
+public sealed class NoOpEventDeduplicator : IEventDeduplicator
+{
+    public Task<bool> TryBeginAsync(Guid eventId, CancellationToken ct = default) =>
+        Task.FromResult(true);
+}
+
 public sealed class RedisEventDeduplicator : IEventDeduplicator
 {
     private static readonly TimeSpan Retention = TimeSpan.FromHours(24);

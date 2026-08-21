@@ -1,5 +1,8 @@
 using JameX.Encoder.Configuration;
 using JameX.Encoder.Encoding;
+using JameX.Encoder.EventHandlers;
+using JameX.Encoder.Storage;
+using JameX.ServiceDefaults.Hosting;
 
 namespace JameX.Encoder;
 
@@ -16,6 +19,12 @@ public static class EncoderRegistrationExtensions
         // Swapping to MediaConvert is this one line — nothing that consumes
         // IEncodingJobRunner needs to know.
         services.AddSingleton<IEncodingJobRunner, FfmpegEncodingJobRunner>();
+
+        services.AddScoped<IMediaStore, MediaStore>();
+
+        // The only event Encoder subscribes to — its queue's filter policy
+        // allows VideoUploaded and nothing else.
+        services.AddEventHandler<VideoUploadedHandler>();
 
         return services;
     }

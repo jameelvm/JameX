@@ -54,6 +54,13 @@ public static class JameXHostingExtensions
 
             builder.Services.AddSingleton<IEventDeduplicator, RedisEventDeduplicator>();
         }
+        else
+        {
+            // No Redis configured: fall back to a filter that lets everything
+            // through. Handlers are required to be idempotent regardless, and a
+            // service must not fail to start because a cache is absent.
+            builder.Services.AddSingleton<IEventDeduplicator, NoOpEventDeduplicator>();
+        }
 
         builder.Services.AddHealthChecks();
 
