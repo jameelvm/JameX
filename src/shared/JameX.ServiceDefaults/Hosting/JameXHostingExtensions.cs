@@ -97,7 +97,10 @@ public static class JameXHostingExtensions
         // The browser talks to the Gateway, but during development it is useful
         // to be able to hit a service directly from the Next.js origin.
         builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy
-            .WithOrigins("http://localhost:3000", "http://localhost:8080")
+            // 3000 — the Next.js frontend (phase 6).
+            // 3100 — the static upload/playback harness in web/debug.
+            // 8080 — the Gateway, for calls proxied through it.
+            .WithOrigins("http://localhost:3000", "http://localhost:3100", "http://localhost:8080")
             .AllowAnyHeader()
             .AllowAnyMethod()
             .WithExposedHeaders("ETag", "X-JameX-Cache")));

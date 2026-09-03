@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JameX — upload &amp; playback harness</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e9ef;
+    --muted:#98a2b3; --accent:#4f8cff; --ok:#3ddc84; --warn:#ffb020; --err:#ff5c5c;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
+  }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:17px; font-weight:600; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(360px,1fr) minmax(420px,1.2fr); gap:16px; padding:16px 24px 32px; }
+  @media (max-width:1000px){ main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .panel h2 { margin:0 0 12px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+  label { display:block; margin:10px 0 4px; font-size:12px; color:var(--muted); }
+  input, select, button {
+    font:inherit; border-radius:7px; border:1px solid var(--line);
+    background:#0d1016; color:var(--text); padding:8px 10px; width:100%;
+  }
+  input[type=file] { padding:6px; }
+  button { background:var(--accent); border-color:var(--accent); color:#fff; cursor:pointer; font-weight:600; }
+  button.secondary { background:transparent; border-color:var(--line); color:var(--text); font-weight:500; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:8px; margin-top:12px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .bar { height:8px; background:#0d1016; border-radius:99px; overflow:hidden; border:1px solid var(--line); }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .parts { display:flex; flex-wrap:wrap; gap:3px; margin-top:10px; }
+  .part { width:16px; height:16px; border-radius:3px; background:#232838; font-size:9px;
+          display:flex; align-items:center; justify-content:center; color:#6b7280; }
+  .part.active { background:var(--warn); color:#000; }
+  .part.done   { background:var(--ok);   color:#000; }
+  .part.failed { background:var(--err);  color:#fff; }
+  #log { height:340px; overflow:auto; background:#0b0d12; border:1px solid var(--line);
+         border-radius:8px; padding:10px; font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  .l-req { color:var(--accent); } .l-res { color:var(--ok); }
+  .l-err { color:var(--err); } .l-note { color:var(--muted); } .l-warn { color:var(--warn); }
+  video { width:100%; border-radius:8px; background:#000; margin-top:4px; }
+  .stat { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .stat:last-child { border-bottom:0; }
+  .stat span:first-child { color:var(--muted); }
+  code { background:#0b0d12; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .hint { color:var(--muted); font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>JameX — upload &amp; playback harness</h1>
+  <p>Exercises the real pipeline: presigned multipart upload → FFmpeg ladder → HLS playback. Every HTTP call is logged on the right.</p>
+</header>
+
+<main>
+  <div>
+    <div class="panel">
+      <h2>1 · Who and where</h2>
+      <div class="grid2">
+        <div><label>Caller (X-JameX-User)</label><input id="userId" value="01a0465d-fcdd-775b-89a5-3c462af1009f"></div>
+        <div><label>Channel id</label><input id="channelId" value="01a04664-528a-7eaf-b3bb-4f908743c791"></div>
+      </div>
+      <div class="grid2">
+        <div><label>Ingest</label><input id="ingestBase" value="http://localhost:8083"></div>
+        <div><label>Catalog</label><input id="catalogBase" value="http://localhost:8082"></div>
+      </div>
+      <p class="hint">Auth is stubbed behind a header — the Gateway would issue a real identity in production.</p>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>2 · Upload</h2>
+      <label>Video file</label>
+      <input type="file" id="file" accept="video/*">
+      <div class="grid2">
+        <div><label>Title</label><input id="title" value="Harness upload"></div>
+        <div><label>Privacy</label>
+          <select id="privacy"><option value="2" selected>Public</option><option value="1">Unlisted</option><option value="0">Private</option></select>
+        </div>
+      </div>
+      <div class="grid2">
+        <div><label>Parallel part uploads</label><input id="concurrency" type="number" value="3" min="1" max="8"></div>
+        <div><label>Tags (comma separated)</label><input id="tags" value="harness,test"></div>
+      </div>
+
+      <div class="row">
+        <button id="start">Start upload</button>
+        <button id="pause" class="secondary" disabled>Simulate drop</button>
+        <button id="resume" class="secondary" disabled>Resume</button>
+      </div>
+      <div class="row"><button id="abort" class="secondary" disabled>Abort upload</button></div>
+
+      <div style="margin-top:14px">
+        <div class="bar"><div id="bar"></div></div>
+        <div class="parts" id="parts"></div>
+        <div class="hint" id="progressText">No upload started.</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>3 · Pipeline status</h2>
+      <div class="stat"><span>videoId</span><span id="sVideo">—</span></div>
+      <div class="stat"><span>status</span><span id="sStatus">—</span></div>
+      <div class="stat"><span>duration</span><span id="sDuration">—</span></div>
+      <div class="stat"><span>renditions</span><span id="sRenditions">—</span></div>
+      <div class="stat"><span>encoded by</span><span id="sEncoder">—</span></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Request log</h2>
+      <div id="log"></div>
+      <div class="row"><button class="secondary" id="clearLog">Clear</button></div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>4 · Playback (hls.js)</h2>
+      <video id="video" controls playsinline></video>
+      <div class="row">
+        <select id="levels"><option>auto</option></select>
+        <button class="secondary" id="play" disabled>Load stream</button>
+      </div>
+      <div class="stat"><span>current level</span><span id="sLevel">—</span></div>
+      <div class="stat"><span>master playlist</span><span id="sMaster" style="font-size:11px">—</span></div>
+      <p class="hint">Switch level manually, or leave it on auto and throttle the network in DevTools to watch hls.js drop quality by itself.</p>
+    </div>
+  </div>
+</main>
+
+<script>
+// ---------------------------------------------------------------- utilities
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+
+function log(kind, message, detail) {
+  const line = document.createElement('div');
+  line.className = 'l-' + kind;
+  const time = new Date().toLocaleTimeString();
+  line.textContent = `${time}  ${message}` + (detail ? `  ${detail}` : '');
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+$('clearLog').onclick = () => logEl.innerHTML = '';
+
+const headers = () => ({ 'Content-Type': 'application/json', 'X-JameX-User': $('userId').value.trim() });
+
+async function api(method, url, body) {
+  log('req', `${method} ${url}`, body ? JSON.stringify(body).slice(0, 120) : '');
+  const response = await fetch(url, {
+    method,
+    headers: headers(),
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    log('err', `← ${response.status}`, text.slice(0, 300));
+    throw new Error(`${method} ${url} → ${response.status}: ${text}`);
+  }
+  log('res', `← ${response.status}`, text.slice(0, 200));
+  return text ? JSON.parse(text) : null;
+}
+
+// ---------------------------------------------------------------- state
+let session = null;   // { uploadId, videoId, partSize, totalParts, file }
+let paused = false;
+
+// Kept so a page reload can pick an upload back up — the same thing the
+// resume endpoint exists for.
+const SAVED = 'jamex.upload';
+const save = () => session && localStorage.setItem(SAVED, JSON.stringify({
+  uploadId: session.uploadId, videoId: session.videoId,
+  partSize: session.partSize, totalParts: session.totalParts, name: session.file?.name
+}));
+
+// ---------------------------------------------------------------- progress
+function drawParts(total) {
+  $('parts').innerHTML = '';
+  for (let i = 1; i <= total; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'part';
+    cell.id = 'p' + i;
+    cell.title = 'part ' + i;
+    $('parts').appendChild(cell);
+  }
+}
+const markPart = (n, state) => { const el = $('p' + n); if (el) el.className = 'part ' + state; };
+
+function updateProgress(done, total) {
+  const percent = total ? Math.round(done / total * 100) : 0;
+  $('bar').style.width = percent + '%';
+  $('progressText').textContent = `${done} of ${total} parts uploaded — ${percent}%`;
+}
+
+// ---------------------------------------------------------------- upload
+$('start').onclick = async () => {
+  const file = $('file').files[0];
+  if (!file) return alert('Choose a video file first.');
+
+  try {
+    $('start').disabled = true;
+    paused = false;
+
+    // STEP 1 — open the upload. No bytes yet; the service only decides how the
+    // file will be sliced and reserves the video id.
+    const created = await api('POST', `${$('ingestBase').value}/uploads`, {
+      channelId: $('channelId').value.trim(),
+      title: $('title').value,
+      description: null,
+      categoryId: null,
+      tags: $('tags').value.split(',').map(t => t.trim()).filter(Boolean),
+      defaultLanguage: 'en',
+      privacy: Number($('privacy').value),
+      fileName: file.name,
+      contentType: file.type || 'video/mp4',
+      sizeBytes: file.size
+    });
+
+    session = {
+      uploadId: created.uploadId, videoId: created.videoId,
+      partSize: created.partSizeBytes, totalParts: created.totalParts, file
+    };
+    save();
+
+    $('sVideo').textContent = created.videoId;
+    log('note', `sliced into ${created.totalParts} parts of ${created.partSizeBytes.toLocaleString()} bytes`);
+    drawParts(created.totalParts);
+    updateProgress(0, created.totalParts);
+
+    $('pause').disabled = false;
+    $('abort').disabled = false;
+
+    await uploadMissingParts();
+  } catch (e) {
+    log('err', e.message);
+    $('start').disabled = false;
+  }
+};
+
+/**
+ * Uploads whichever parts the server says are still missing.
+ * Used both for the first run and for resume — which is the point: the client
+ * never assumes it knows what landed, it asks.
+ */
+async function uploadMissingParts() {
+  const ingest = $('ingestBase').value;
+
+  const status = await api('GET', `${ingest}/uploads/${session.uploadId}`);
+  const have = new Set(status.uploadedPartNumbers);
+  have.forEach(n => markPart(n, 'done'));
+
+  const missing = [];
+  for (let n = 1; n <= session.totalParts; n++) if (!have.has(n)) missing.push(n);
+
+  if (missing.length === 0) { await complete(); return; }
+  log('note', `${have.size} part(s) already on the server; sending ${missing.length}`);
+
+  // STEP 2 — ask for presigned URLs in one batch rather than one at a time.
+  const presigned = await api('POST', `${ingest}/uploads/${session.uploadId}/parts/presign`,
+    { partNumbers: missing });
+  const urls = new Map(presigned.parts.map(p => [p.partNumber, p.url]));
+
+  let done = have.size;
+  const queue = [...missing];
+  const workers = Math.max(1, Math.min(8, Number($('concurrency').value) || 3));
+
+  async function worker() {
+    while (queue.length) {
+      if (paused) return;
+      const n = queue.shift();
+      markPart(n, 'active');
+
+      const start = (n - 1) * session.partSize;
+      const blob = session.file.slice(start, Math.min(start + session.partSize, session.file.size));
+
+      try {
+        // STEP 3 — the bytes go STRAIGHT to S3. This request never touches
+        // our services, which is the whole reason a 600 MB upload does not
+        // make Ingest the bottleneck.
+        log('req', `PUT part ${n} → S3`, `${blob.size.toLocaleString()} bytes`);
+        const put = await fetch(urls.get(n), { method: 'PUT', body: blob });
+        if (!put.ok) throw new Error(`S3 returned ${put.status}`);
+
+        // The receipt. Readable ONLY because the bucket's CORS config exposes
+        // the ETag header — without that this line returns null and the upload
+        // can never be completed.
+        const etag = put.headers.get('ETag');
+        if (!etag) throw new Error('ETag not readable — check the bucket CORS ExposeHeaders');
+        log('res', `← part ${n} ETag`, etag);
+
+        // STEP 4 — tell Ingest the part landed, so a later resume knows.
+        await api('PUT', `${$('ingestBase').value}/uploads/${session.uploadId}/parts/${n}`, { eTag: etag });
+
+        markPart(n, 'done');
+        updateProgress(++done, session.totalParts);
+      } catch (e) {
+        markPart(n, 'failed');
+        log('err', `part ${n} failed`, e.message);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workers }, worker));
+
+  if (paused) { log('warn', 'paused — press Resume to continue'); $('resume').disabled = false; return; }
+  if (done === session.totalParts) await complete();
+  else { log('warn', 'some parts failed; press Resume to retry only those'); $('resume').disabled = false; }
+}
+
+/** STEP 5 — assemble in S3 and announce. This one goes through Ingest. */
+async function complete() {
+  const ingest = $('ingestBase').value;
+  const status = await api('GET', `${ingest}/uploads/${session.uploadId}`);
+
+  // Ingest already holds every ETag, so an empty list tells it to use its own
+  // record. Passing them back is the cross-check.
+  const result = await api('POST', `${ingest}/uploads/${session.uploadId}/complete`, { parts: [] });
+
+  log('note', `upload complete — ${result.sizeBytes.toLocaleString()} bytes assembled, status Queued`);
+  $('pause').disabled = true; $('resume').disabled = true; $('abort').disabled = true;
+  $('start').disabled = false;
+  localStorage.removeItem(SAVED);
+
+  pollCatalog(result.videoId);
+}
+
+$('pause').onclick = () => { paused = true; log('warn', 'simulating a dropped connection'); $('resume').disabled = false; };
+$('resume').onclick = async () => {
+  paused = false; $('resume').disabled = true;
+  log('note', 'resuming — asking the server which parts it already has');
+  try { await uploadMissingParts(); } catch (e) { log('err', e.message); }
+};
+$('abort').onclick = async () => {
+  if (!session) return;
+  try {
+    await fetch(`${$('ingestBase').value}/uploads/${session.uploadId}`, { method: 'DELETE', headers: headers() });
+    log('warn', 'upload aborted; S3 parts discarded');
+  } catch (e) { log('err', e.message); }
+  session = null; localStorage.removeItem(SAVED);
+  $('start').disabled = false; $('pause').disabled = true; $('resume').disabled = true; $('abort').disabled = true;
+};
+
+// ---------------------------------------------------------------- pipeline
+const STATUS = { 0:'Uploading', 1:'Queued', 2:'Transcoding', 3:'Ready', 4:'Failed', 5:'Rejected' };
+
+/**
+ * Polls Catalog until the encoder has finished. In a real UI this would be a
+ * websocket or SSE; polling keeps the harness dependency-free.
+ */
+async function pollCatalog(videoId) {
+  const catalog = $('catalogBase').value;
+  log('note', 'waiting for the encoder…');
+
+  for (let attempt = 0; attempt < 120; attempt++) {
+    try {
+      const response = await fetch(`${catalog}/videos/${videoId}`);
+      if (response.ok) {
+        const video = await response.json();
+        $('sStatus').textContent = STATUS[video.status] ?? video.status;
+        $('sDuration').textContent = video.durationSeconds ? video.durationSeconds.toFixed(1) + 's' : '—';
+        $('sRenditions').textContent = video.renditions?.length
+          ? video.renditions.map(r => r.label).join(', ') : '—';
+
+        if (video.status === 3) {
+          log('res', 'video is Ready', `${video.renditions.length} renditions`);
+          $('sMaster').textContent = video.masterPlaylistUrl;
+          $('play').disabled = false;
+          $('play').dataset.src = video.masterPlaylistUrl;
+          setupLevels(video.renditions);
+          return;
+        }
+        if (video.status === 4) { log('err', 'encoding failed'); return; }
+      }
+    } catch { /* catalog may briefly refuse; keep polling */ }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  log('warn', 'gave up waiting for the encoder');
+}
+
+// ---------------------------------------------------------------- playback
+let hls = null;
+
+function setupLevels(renditions) {
+  const select = $('levels');
+  select.innerHTML = '<option value="-1">auto</option>';
+  renditions.forEach((r, i) => {
+    const option = document.createElement('option');
+    option.value = i;
+    option.textContent = `${r.label} (${r.width}x${r.height}, ${r.bitrateKbps} kbps)`;
+    select.appendChild(option);
+  });
+}
+
+$('play').onclick = () => {
+  const src = $('play').dataset.src;
+  const video = $('video');
+  log('note', 'loading HLS stream', src);
+
+  if (hls) { hls.destroy(); hls = null; }
+
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ debug: false });
+    hls.loadSource(src);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+      log('res', `master playlist parsed — ${data.levels.length} levels`,
+          data.levels.map(l => l.height + 'p').join(', '));
+      video.play().catch(() => log('warn', 'autoplay blocked — press play'));
+    });
+
+    // The line that makes adaptive streaming visible: fired every time hls.js
+    // decides to change quality mid-playback.
+    hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+      const level = hls.levels[data.level];
+      $('sLevel').textContent = `${level.height}p @ ${Math.round(level.bitrate / 1000)} kbps`;
+      log('note', `switched to ${level.height}p`);
+    });
+
+    hls.on(Hls.Events.ERROR, (_, data) => log('err', 'hls.js ' + data.details, data.fatal ? 'FATAL' : ''));
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari plays HLS natively and needs no library at all.
+    video.src = src;
+    log('note', 'using native HLS (Safari)');
+  } else {
+    log('err', 'hls.js failed to load and this browser has no native HLS');
+  }
+};
+
+$('levels').onchange = e => {
+  if (!hls) return;
+  hls.currentLevel = Number(e.target.value);
+  log('note', e.target.value === '-1' ? 'quality set to auto' : 'quality pinned');
+};
+
+// ---------------------------------------------------------------- restore
+(function restore() {
+  const raw = localStorage.getItem(SAVED);
+  if (!raw) return;
+  const saved = JSON.parse(raw);
+  log('warn', `an unfinished upload for "${saved.name}" was found`,
+      'choose the same file and press Resume');
+  session = { ...saved, file: null };
+  $('sVideo').textContent = saved.videoId;
+  drawParts(saved.totalParts);
+  $('resume').disabled = false;
+  $('resume').onclick = async () => {
+    const file = $('file').files[0];
+    if (!file) return alert('Choose the same file again so its bytes can be re-read.');
+    session.file = file; paused = false; $('resume').disabled = true;
+    try { await uploadMissingParts(); } catch (e) { log('err', e.message); }
+  };
+})();
+
+log('note', 'harness ready — choose a video and press Start upload');
+</script>
+</body>
+</html>

@@ -1,11 +1,16 @@
-﻿{
+{
   "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "JameX.Encoder": {
+    // Requires FFmpeg on PATH — see appsettings.Development.json. If FFmpeg is
+    // not installed, debug the Encoder in its container instead
+    // (docker compose logs -f encoder).
+    "Encoder (local)": {
       "commandName": "Project",
       "dotnetRunMessages": true,
+      "launchBrowser": false,
+      "applicationUrl": "http://localhost:5086",
       "environmentVariables": {
-        "DOTNET_ENVIRONMENT": "Development"
+        "ASPNETCORE_ENVIRONMENT": "Development"
       }
     }
   }

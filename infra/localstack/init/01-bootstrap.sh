@@ -32,9 +32,15 @@ awslocal s3api create-bucket --bucket "${MEDIA_BUCKET}" --region "${REGION}" >/d
 # to read the ETag back off its own response — completing a multipart upload
 # requires echoing the ETag of every part. Omit this and uploads can never
 # finish, with no useful error to explain why.
+#
+# app.localstack.cloud is included so the Resource Browser (a page on that
+# origin, running in your own browser) can list and preview objects in this
+# bucket. Without it, opening jamex-raw there fails with an opaque "network
+# failure" — CORS blocked the request client-side and no error surfaces from
+# LocalStack's side to explain why.
 awslocal s3api put-bucket-cors --bucket "${RAW_BUCKET}" --cors-configuration '{
   "CORSRules": [{
-    "AllowedOrigins": ["http://localhost:3000", "http://localhost:8080"],
+    "AllowedOrigins": ["http://localhost:3000", "http://localhost:3100", "http://localhost:8080", "https://app.localstack.cloud"],
     "AllowedMethods": ["PUT", "POST", "GET", "HEAD", "DELETE"],
     "AllowedHeaders": ["*"],
     "ExposeHeaders": ["ETag", "x-amz-request-id"],

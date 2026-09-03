@@ -1,20 +1,18 @@
 {
   "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "http": {
+    // Fixed port, not a random one. The Gateway lists this exact address as a
+    // second destination for the catalog cluster, so starting the service here
+    // is all it takes for traffic to find it.
+    //
+    // 5082 mirrors the container's published 8082 — same last two digits, so
+    // the mapping stays obvious.
+    "Catalog (local)": {
       "commandName": "Project",
       "dotnetRunMessages": true,
       "launchBrowser": true,
-      "applicationUrl": "http://localhost:5144",
-      "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
-      }
-    },
-    "https": {
-      "commandName": "Project",
-      "dotnetRunMessages": true,
-      "launchBrowser": true,
-      "applicationUrl": "https://localhost:7282;http://localhost:5144",
+      "launchUrl": "scalar",
+      "applicationUrl": "http://localhost:5082",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       }
