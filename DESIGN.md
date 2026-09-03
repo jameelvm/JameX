@@ -9,9 +9,9 @@ able to answer from it. `README.md` explains *how it was built*; this explains
 Read §5 before an interview — it is the question bank, with the answer compressed
 to the point you need to make.
 
-**Status.** Covers phases 1–3 (infrastructure, service decomposition, Identity
-and Catalog). Sections marked ⬜ are designed but not yet built. This document
-grows at the end of every phase.
+**Status.** Covers phases 1–4 (infrastructure, service decomposition, Identity
+and Catalog, Ingest and Encoder). Sections marked ⬜ are designed but not yet
+built. This document grows at the end of every phase.
 
 ---
 
@@ -118,9 +118,9 @@ no redeploy upstream.
 
 | Event | Published by | Consumed by |
 |---|---|---|
-| `VideoUploaded` | Ingest ⬜ | Encoder, Catalog |
-| `VideoEncoded` | Encoder ⬜ | Catalog, Search, Engagement |
-| `VideoEncodingFailed` | Encoder ⬜ | Catalog |
+| `VideoUploaded` | Ingest ✅ | Encoder, Catalog |
+| `VideoEncoded` | Encoder ✅ | Catalog, Search, Engagement |
+| `VideoEncodingFailed` | Encoder ✅ | Catalog |
 | `VideoDeleted` | **Catalog ✅** | Search, Engagement |
 
 ### Storage, and why each store exists
@@ -290,6 +290,94 @@ other cannot.
 
 ---
 
+### 3.6 Upload and transcoding (phase 4)
+
+---
+
+**Data-plane / control-plane split**
+
+- *Alternative:* route uploaded bytes through the application tier.
+- *Why:* chapter 2 sizes ingest at ~480 Gbps. A service in that path becomes
+  the bottleneck and needs disk or memory to buffer 600 MB originals per
+  upload. Ingest's entire API exchanges kilobytes of JSON — ids, part numbers,
+  ETags — never bytes. The browser PUTs parts straight to S3 with presigned
+  URLs; the service only issues credentials and tracks state.
+- *Where:* `RawUploadStore`, `UploadService`.
+
+---
+
+**Atomic per-part writes, not read-modify-write, for resumable upload state**
+
+- *Alternative:* read the session, add the part, write the whole item back.
+- *Why:* a browser uploads several parts in parallel. Two completions overlap
+  under read-modify-write: both read a 4-entry map, each adds its own key,
+  each writes back 5 — one ETag is silently lost, and the upload can never
+  complete because S3 requires the full set. `UpdateExpression = "SET
+  parts.#n = :etag"` targets one key inside the map server-side; concurrent
+  writers touch different keys and cannot conflict.
+- *Where:* `UploadSessionRepository.RecordPartAsync`.
+
+---
+
+**Idempotent completion without a database transaction**
+
+- *Alternative:* accept that a crash between "mark complete" and "publish"
+  loses the event, the way a naive implementation would.
+- *Why:* Ingest owns no relational store, so it cannot use Catalog's
+  transactional outbox — there's no transaction to enrol a claim in. Instead,
+  the event id is minted once and stored *with* the state transition, guarded
+  by a condition only the first caller can satisfy
+  (`status = InProgress` at write time). A retried `Complete` call fails that
+  condition, reads back the already-stored id, and republishes byte-identical
+  bytes — which the consumer's inbox then recognises as a duplicate. Narrower
+  than a true outbox (the window shrinks, it doesn't close) but the strongest
+  available guarantee with no database.
+- *Where:* `UploadSession.CompletionEventId`, `TryMarkCompletedAsync`.
+
+---
+
+**Forced GOP alignment across every rendition**
+
+- *Alternative:* let the encoder place keyframes automatically per rendition.
+- *Why:* a player can only switch quality at a segment boundary, and only if
+  every rendition's boundaries fall at the same instant. Left alone, an
+  encoder places keyframes wherever a scene changes — a different moment in
+  every rendition, because each sees the frame differently at that bitrate.
+  `-g`, `-keyint_min` and `-sc_threshold 0` force an identical keyframe
+  interval everywhere, so every rendition's segments align.
+- *Where:* `FfmpegEncodingJobRunner.EncodeRungAsync`.
+
+---
+
+**Never encode a rendition taller than the source**
+
+- *Alternative:* always produce the full configured ladder.
+- *Why:* upscaling invents pixels — the output costs more bandwidth and
+  storage than the original while looking worse. Ladder selection filters to
+  `Height <= source.Height`. The edge case — a source smaller than every
+  configured rung — was originally handled by falling back to the smallest
+  *configured* rung, which silently upscaled anyway; fixed to fall back to
+  the source's own height instead.
+- *Where:* `FfmpegEncodingJobRunner.SelectRungs`.
+
+---
+
+**Permanent vs. transient failure, treated as genuinely different**
+
+- *Alternative:* catch every exception and report the job failed; or catch
+  nothing and let the queue retry everything blindly.
+- *Why:* a corrupt file fails identically on every attempt — retrying it
+  burns three receives and compute to reach the same conclusion before
+  landing in the DLQ with a generic message. A down S3 endpoint is different
+  a minute later — swallowing that as a permanent failure marks a perfectly
+  good video as broken forever. `EncodingFailedException` and `TimeoutException`
+  are caught and published as `VideoEncodingFailed`; everything else
+  propagates uncaught, leaving the message for the queue's own
+  retry-with-backoff.
+- *Where:* `VideoUploadedHandler.HandleAsync`.
+
+---
+
 ## 4. Failure modes and what defends against them
 
 The most useful way to hold the design in your head.
@@ -309,8 +397,14 @@ The most useful way to hold the design in your head.
 | 11 | A poison message retries forever | DLQ after 3 receives; outbox stops at 10 attempts and logs loudly | ✅ |
 | 12 | A client requests a million rows | Page size clamped, batch size capped | ✅ |
 | 13 | A viral video's first seconds DDoS the origin | `proxy_cache_lock` — one request fills, the rest wait | ✅ (infra) |
-| 14 | A 600 MB upload blocks a request thread | Presigned direct-to-S3 multipart | ⬜ phase 4 |
+| 14 | A 600 MB upload blocks a request thread | Presigned direct-to-S3 multipart | ✅ |
 | 15 | A view counter becomes a hot partition | Sharded counters, scatter writes / gather reads | ⬜ phase 5 |
+| 17 | Two parts of the same upload land at once | `UpdateExpression` on one map key, not read-modify-write | ✅ |
+| 18 | Completion is retried (client timeout, double-click) | Event id stored with the state transition; retry reuses it | ✅ |
+| 19 | A rendition would be taller than the source | Ladder generation skips it; falls back to source's own height | ✅ |
+| 20 | ABR renditions cut keyframes at different moments | Forced GOP (`-g`, `-keyint_min`, `-sc_threshold 0`) | ✅ |
+| 21 | A permanent encode failure retries forever | `EncodingFailedException` caught, published, not retried | ✅ |
+| 22 | A transient fault (S3 down) is mistaken for a bad file | Left uncaught — propagates to the queue's own retry | ✅ |
 | 16 | The metadata database outgrows one machine | Read replicas, then sharding by `channelId` (Vitess) | ⬜ designed only |
 
 ---
@@ -446,7 +540,7 @@ By write rate on the hot key. `subscriber_count` is denormalised because
 subscriptions are low-volume. View counts are not, because one row cannot absorb
 a viral video's write rate — those become sharded counters.
 
-**"How do you handle the write volume on view counts?"** ⬜
+**"How do you handle the write volume on view counts?"** ⬜ phase 5
 Sharded counters in DynamoDB. One item per video is a hot partition capped near
 1,000 writes/sec; writes scatter across N shard keys and reads gather and sum.
 You trade instantaneous exactness for linear write scaling — acceptable, because
@@ -465,11 +559,60 @@ fleet, and YouTube built it for exactly this. The shard key would be
 Batch resolution endpoints on every service that owns lookup data, so the
 aggregation layer makes one call per service per page rather than one per item.
 
-**"Why direct-to-S3 upload instead of through the API?"** ⬜
+**"Why direct-to-S3 upload instead of through the API?"**
 A 600 MB upload through the application tier occupies a request thread for
 minutes, needs disk or memory to buffer, and makes the service the bottleneck at
 480 Gbps ingest. Presigned multipart URLs let the browser write straight to S3;
 resume comes free because parts are independently retryable.
+
+**"How do you make a large upload resumable?"**
+One record per upload holding every confirmed part's ETag. On reconnect the
+client asks which parts already landed — via a strongly-consistent read, so a
+part confirmed a moment ago is never reported missing — and re-sends only the
+gaps. Recording a part safely under concurrency is the subtle part: a
+read-modify-write across parallel part completions loses updates, so the
+write targets one key inside a nested map directly (`SET parts.#n = :etag`)
+rather than reading the whole item first.
+
+**"You don't have a database in this service. How do you make an operation
+idempotent without one?"**
+Store the id of the event you're about to publish *with* the state
+transition it's tied to, guarded by a condition only the first caller can
+satisfy. A retry fails that condition, reads back the id that already won,
+and republishes byte-identical bytes — which the downstream consumer's inbox
+then recognises as a duplicate. Weaker than a transactional outbox — the
+window narrows rather than closes — but it's the strongest guarantee
+available with no relational store to enrol a claim in.
+
+**"Walk me through how adaptive bitrate switching actually works."**
+Two file types. One master playlist lists every quality with its bandwidth
+and resolution; the player reads it once and picks a starting quality — lowest
+first, so playback starts immediately rather than stalling on a stream too
+big for an unknown connection. Each quality then has its own playlist listing
+that quality's segments. Switching mid-playback means fetching a different
+quality's playlist and continuing from there — which only works cleanly if
+every quality's segments are cut at identical timestamps. That alignment
+needs an explicit forced keyframe interval; left alone, the encoder places
+keyframes wherever the scene changes, a different moment in every rendition.
+
+**"When would you deliberately not use the highest-quality settings available
+for a rendition?"**
+When the source doesn't support them. A rendition taller than the source
+invents pixels — costing bandwidth and storage to produce output that is both
+larger and blurrier than the original. Ladder generation always caps at the
+source's own resolution, including the edge case of a source smaller than
+every configured rung, where it produces one rendition at the source's native
+size rather than upscaling to the smallest configured option.
+
+**"How do you decide whether to retry a failed background job?"**
+Split the exception space into permanent and transient, and only retry the
+second kind. A corrupt file or an unsupported codec fails identically on
+every attempt — retrying burns compute to reach the same conclusion three
+times before landing in a dead-letter queue with a generic error. A down
+dependency (storage, network) is different tomorrow, so those exceptions are
+left to propagate and let the queue's own retry-with-backoff handle them.
+Catching everything into one failure path loses this distinction and either
+wastes retries on the unfixable or gives up too early on the recoverable.
 
 ### Implementation-level
 
@@ -506,8 +649,9 @@ repository and domain layers did not change by a line — which is the real poin
 | Pub/sub fan-out with filtering | Good | ✅ |
 | Back-of-envelope estimation | Good | — analysis only |
 | Sharded counters, hot partitions | Designed | ⬜ phase 5 |
-| Large-file upload, resumability | Designed | ⬜ phase 4 |
-| Transcoding, ABR ladder | Designed | ⬜ phase 4 |
+| Large-file upload, resumability | **Strong** | ✅ verified: concurrent parts, resume, idempotent completion |
+| Transcoding, ABR ladder | **Strong** | ✅ verified: GOP alignment, no-upscale, real FFmpeg |
+| Data-plane / control-plane separation | **Strong** | ✅ bytes bypass the service; only metadata does not |
 | Inverted index vs relational FTS | Designed | ⬜ phase 5 |
 | CDN tiering by popularity | Designed | ⬜ phase 5–6 |
 | Database sharding, Vitess | Reading only | ⬜ not planned |

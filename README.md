@@ -10,10 +10,9 @@ component that document describes has a real, runnable counterpart here.
 **Stack:** .NET 10 · PostgreSQL · DynamoDB · S3 · SQS · SNS · Redis · FFmpeg ·
 YARP · Next.js · Docker Compose + LocalStack
 
-**Build status:** phases 1–3 complete and verified. Infrastructure, the service
-skeleton, and the Identity and Catalog services all run — including the inbox
-and outbox patterns that make the event bus safe. Upload and playback arrive in
-phase 4.
+**Build status:** phases 1–4 complete and verified. The whole pipeline runs
+end to end: presigned resumable upload → FFmpeg ABR ladder → Catalog → CDN
+playback. A real video goes from upload to playable HLS in under 20 seconds.
 
 ---
 
@@ -27,9 +26,10 @@ phase 4.
 6. [Phase 1 — the local AWS environment](#6-phase-1--the-local-aws-environment)
 7. [Phase 2 — the service architecture](#7-phase-2--the-service-architecture)
 8. [Phase 3 — Identity and Catalog](#8-phase-3--identity-and-catalog)
-9. [Verification](#9-verification)
-10. [Interview talking points](#10-interview-talking-points)
-11. [Roadmap](#11-roadmap)
+9. [Phase 4 — Ingest and Encoder](#9-phase-4--ingest-and-encoder)
+10. [Verification](#10-verification)
+11. [Interview talking points](#11-interview-talking-points)
+12. [Roadmap](#12-roadmap)
 
 ---
 
@@ -1318,7 +1318,262 @@ availability.
 
 ---
 
-## 9. Verification
+## 9. Phase 4 — Ingest and Encoder
+
+This is the phase that makes the system actually playable. Phase 3 built a
+Catalog that could react to `VideoUploaded` and `VideoEncoded` — but nothing
+published them. Phase 4 builds the two services that do, and the moment the
+first real one was published, Catalog's already-tested handlers processed it
+with **zero code changes**. That's the payoff for building the receiving side
+first.
+
+### 9.1 What exists now
+
+| | Ingest | Encoder |
+|---|---|---|
+| Owns | `jamex-upload-sessions` (DynamoDB), `jamex-raw` writes | `jamex-media` writes |
+| Endpoints | 6 (`/uploads/...`) | 1 dev-only debug endpoint |
+| Publishes | `VideoUploaded` | `VideoEncoded`, `VideoEncodingFailed` |
+| Consumes | — | `VideoUploaded` |
+| Scales on | connection count / bandwidth | queue depth |
+
+### 9.2 The constraint that shapes Ingest: bytes never pass through it
+
+Chapter 2 sizes ingest at ~480 Gbps. Routing that through an application
+service would make the service the bottleneck and would need disk or memory to
+buffer 600 MB originals per upload. So Ingest's entire API surface exchanges
+kilobytes of JSON — ids, part numbers, ETags — never bytes. The browser PUTs
+parts **directly to S3** using presigned URLs Ingest hands out; Ingest only
+issues credentials and tracks state.
+
+This is the data-plane / control-plane split:
+
+```
+Data plane   (the video bytes)     Browser ──────────► S3 directly
+Control plane (start, track, complete)  Browser ──► Ingest ──► S3 API calls
+```
+
+### 9.3 The multipart plan — S3's constraints made concrete
+
+`MultipartPlan.For(totalBytes, preferredPartSizeBytes)` decides how a file is
+sliced, and does it **before a single byte moves** — a client that discovered
+an impossible part count only at completion would have wasted its entire
+upload.
+
+```csharp
+public const long MinPartSizeBytes = 5 * 1024 * 1024;   // S3's hard minimum
+public const int  MaxParts        = 10_000;              // S3's hard ceiling
+```
+
+The two constants are facts AWS imposes, not choices — that's why they're
+`const` in `MultipartPlan`, not configuration. What *is* configuration
+(`UploadOptions.PreferredPartSizeBytes = 8 MB`, `MaxUploadBytes = 20 GB`) lives
+in Ingest's own options class, not shared plumbing — no other service has any
+business knowing Ingest's part-size preference.
+
+Verified: a 600 MB file → exactly 75 parts of 8 MB. A 100 GB file would need
+the part size to grow, because the 10,000-part ceiling binds before the 5 GB
+per-part ceiling does.
+
+### 9.4 Resumability — one DynamoDB item, one atomic write
+
+`UploadSession` (DynamoDB, `jamex-upload-sessions`) is chapter 3's *"server
+retains data temporarily to allow resumption"* — the record that lets a
+dropped connection resume instead of restarting a 600 MB transfer. One item
+per upload; every part's ETag lives inside a single nested `parts` map, not as
+separate rows:
+
+```json
+{ "uploadId": "...", "parts": { "1": "abc123...", "2": "def456..." } }
+```
+
+**The one line that makes concurrent part uploads safe:**
+
+```csharp
+UpdateExpression = "SET #parts.#n = :etag"
+```
+
+The obvious alternative — read the session, add the part, write it back — is a
+lost-update race: a browser uploads several parts in parallel, two completions
+overlap, both read a 4-entry map, each adds its own, each writes back 5. One
+ETag silently vanishes, and the upload can never complete because S3 requires
+the full set. `UpdateItem` targeting one key inside the map sidesteps the race
+entirely — concurrent writers touch different map keys and cannot conflict.
+
+Verified with 3 truly concurrent part-record calls: all 3 survived.
+
+### 9.5 Idempotent completion — Ingest's answer to the outbox problem
+
+Ingest owns no relational database, so it cannot use Catalog's transactional
+outbox — there's no transaction to enrol an event in. It marks the session
+Completed and *then* publishes: two writes, so a crash between them could lose
+the event.
+
+The mitigation is to make completion **safely repeatable**:
+
+```csharp
+ConditionExpression = "attribute_exists(uploadId) AND #status = :inProgress"
+```
+
+Only the first `Complete` call wins that condition; a retry reuses the
+**already-stored** `completionEventId` instead of minting a new one. Verified
+by calling `/complete` twice — both calls published the identical event id.
+Because the id is stable, Catalog's inbox (Phase 3) rejects the duplicate
+automatically. Weaker than a true outbox — the window narrows from "lost
+forever" to "published on the next attempt" rather than closing outright — but
+it's the strongest guarantee available without a database.
+
+### 9.6 Why the video bytes *do* pass through Encoder, and why that's a separate service
+
+Encoder is the one service in the whole system where bytes genuinely flow
+through the process — transcoding means decoding every frame, which cannot
+happen without the file being local. That's exactly why it's split from
+Ingest: Ingest scales on connection count and needs neither CPU nor disk;
+Encoder scales on queue depth and needs both. Forcing them into one service
+would make the CPU-bound half throttle the connection-bound half.
+
+### 9.7 FFmpeg behind an interface
+
+`IEncodingJobRunner` is deliberately file-in, files-out — it knows nothing
+about S3, SQS or events, which is what let it be tested with a debug endpoint
+that runs the real ladder over a synthetic clip, no infrastructure required.
+
+```csharp
+Task<SourceProbe> ProbeAsync(string sourcePath, CancellationToken ct);
+Task<EncodingResult> RunAsync(EncodingJob job, CancellationToken ct);
+```
+
+`FfmpegEncodingJobRunner` is one implementation. A MediaConvert adapter is a
+second implementation of the same interface — the pipeline that consumes it
+never changes.
+
+**The three flags that make adaptive switching actually work:**
+
+```
+-g 144 -keyint_min 144 -sc_threshold 0
+```
+
+A player can only switch quality **at a segment boundary**, and only if every
+rendition's boundaries land at the same instant. Left to itself, FFmpeg inserts
+keyframes wherever the scene changes — a different moment in every rendition —
+so segments drift apart between qualities and switching produces a stutter or
+an outright gap. Fixed GOP length plus disabled scene-change keyframes forces
+every rendition to cut at the same six-second marks.
+
+**Never upscale — the rule and the bug it caught.** Rendition selection is
+`Where(r => r.Height <= probe.Height)` — never taller than the source, because
+inventing pixels costs CPU and bytes to produce something *larger and
+blurrier* than the original. The fallback path for a source smaller than every
+configured rung originally used the smallest configured rung's height, which
+silently upscaled a 180p source to 240p. Fixed to encode at the **source's own
+height** instead — verified: a 180p source now produces a single 320×180
+rendition, not 428×240.
+
+**The master playlist is the menu, not the food.** Built by hand rather than
+via FFmpeg's `var_stream_map`, listed lowest-bitrate first so a player with no
+bandwidth estimate starts low and improves rather than stalling:
+
+```
+#EXT-X-STREAM-INF:BANDWIDTH=440000,RESOLUTION=428x240,...
+240p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3080000,RESOLUTION=1280x720,...
+720p/playlist.m3u8
+```
+
+`BANDWIDTH` is peak, not average, and includes audio — understating it lets a
+player pick a stream too heavy for its link and rebuffer.
+
+### 9.8 The handler — download, encode, upload, announce
+
+`VideoUploadedHandler` orchestrates four steps and cleans up on every path:
+
+```
+download raw file from jamex-raw
+  → runner.RunAsync()               (Module 3's whole FFmpeg pipeline, LOCAL disk only)
+  → upload every rendition + thumbnails + master.m3u8 to jamex-media (master LAST)
+  → publish VideoEncoded            (or VideoEncodingFailed)
+finally: delete the scratch directory, always
+```
+
+**Master playlist uploads last, deliberately.** It's the file a player fetches
+first; uploading it before the segments exist would create a window where a
+viewer could load the manifest and hit "not found" on every segment it
+references. Uploading it last guarantees that the moment it's reachable,
+everything it points to already is too.
+
+**Permanent failures are caught; transient ones are not — and that split is
+the whole design:**
+
+```csharp
+catch (EncodingFailedException ex)   { PublishFailedAsync(...); }  // corrupt file — retrying is pure waste
+catch (TimeoutException ex)          { PublishFailedAsync(...); }  // too big once, too big again
+// everything else (S3 unreachable, disk full) propagates uncaught
+```
+
+If every exception were turned into `VideoEncodingFailed`, a transient network
+blip would permanently mark a good video as failed. If none were, a genuinely
+corrupt file would retry three times, burn CPU each time, then land in the DLQ
+with a generic failure instead of a clear reason. The split gets both cases
+right.
+
+**Idempotency here is Redis, not an inbox — and that's the correct tool for
+this service.** Encoder owns no relational store, so there's no transaction to
+put the claim inside. `RedisEventDeduplicator` narrows the window rather than
+closing it, but it's genuinely valuable here: re-encoding a video costs
+minutes of CPU, not a wasted `UPDATE`. `NoOpEventDeduplicator` (new in this
+phase) makes Redis optional service-wide — a service without Redis configured
+now falls back to "treat everything as new" rather than failing to start.
+
+### 9.9 The debug harness — `web/debug/index.html`, port 3100
+
+Testing the upload flow with `curl` only exercises the half that can't fail in
+a browser. The presigned-URL flow is browser-shaped by design: the client
+slices the file, reads the **`ETag` response header** off its own PUT, and
+sends it back to complete — and that header is only readable because of a CORS
+`ExposeHeaders` rule, which `curl` doesn't need and would never catch missing.
+
+A single self-contained HTML page — no build step, no framework — with a file
+picker, a live per-part progress grid, **Simulate drop / Resume** buttons that
+exercise `GetStatus`'s missing-parts logic for real, and an hls.js player with
+a manual quality selector. Served on **3100**, not 3000: that port was already
+occupied by another app on the host, and 3100 is now an allowed origin in both
+the service CORS policy and the raw bucket's CORS rules — 3000 stays free for
+the real Next.js frontend in phase 6.
+
+This harness caught the CORS gap directly: the first version of the presigned
+URLs came back as `https://`, which LocalStack — plain HTTP on 4566 — refused
+outright with a bare connection failure. `curl` never surfaces that class of
+bug; a browser does immediately.
+
+### 9.10 What phase 4 does not do, and three environment findings worth knowing
+
+- **No resumable download / range requests on playback** — the edge cache
+  serves whole segments; that's standard HLS and needs nothing extra here.
+- **No adaptive tiering** (`PopularityTier`) — every video is still `Cold`;
+  chapter 5's placement logic is a phase 5–6 concern.
+- **LocalStack's SNS→SQS fan-out proved unreliable under heavy repeated local
+  testing** — messages were sometimes dropped, and the Encoder's consumer was
+  twice observed to wedge (stuck `NotVisible`, consumer idle, no log output)
+  in a way that outlived an Encoder restart. Recovery that worked reliably:
+  delete and recreate the queue, resubscribe it to the topic with its filter
+  policy, **reapply its SNS access policy** (lost on delete — queues don't
+  keep it automatically), then restart the consumer. A full `docker compose
+  down` / `up` cleared it every time that was tried. This is a property of the
+  local emulator, not the application — the one clean run captured for
+  verification went upload-to-playable in 9–20 seconds with no intervention.
+- **`jamex-edge` (nginx) resolves its LocalStack upstream once, at container
+  startup.** Recreating LocalStack (a new image, a `down`/`up`) while `edge`
+  keeps running leaves it routing to a dead IP — every `/media/...` request
+  502s with no obvious cause. Fix: restart `edge` after any LocalStack
+  recreation.
+- **LocalStack's Persistence feature needs a paid Base/Ultimate plan** — this
+  project runs on the free tier, so S3 objects do not survive a
+  `docker compose down`. Postgres and, by an unrelated implementation detail,
+  DynamoDB do. See `PROGRESS.md` for the full finding.
+
+---
+
+## 10. Verification
 
 Everything below was run and passed on 2026-08-07.
 
@@ -1488,9 +1743,77 @@ Also note that redirecting a service's stdout to a file block-buffers the log,
 so `dotnet run > app.log` lags badly and only flushes on exit. **The database is
 the reliable source of truth when verifying handlers.**
 
+### Phase 4 — Ingest and Encoder
+
+```bash
+# --- the whole pipeline, timed, upload to playable ------------------------
+USER=<a real user id>                    # POST /users, as in phase 3
+CHANNEL=<a real channel id>               # POST /channels
+
+SIZE=$(stat -c%s myvideo.mp4)
+R=$(curl -s -X POST localhost:8083/uploads -H 'Content-Type: application/json' \
+     -H "X-JameX-User: $USER" \
+     -d "{\"channelId\":\"$CHANNEL\",\"title\":\"Test\",\"privacy\":2,
+          \"fileName\":\"myvideo.mp4\",\"contentType\":\"video/mp4\",\"sizeBytes\":$SIZE}")
+UP=$(echo "$R" | jq -r .uploadId); VID=$(echo "$R" | jq -r .videoId)
+
+URL=$(curl -s -X POST "localhost:8083/uploads/$UP/parts/presign" \
+      -H 'Content-Type: application/json' -H "X-JameX-User: $USER" \
+      -d '{"partNumbers":[1]}' | jq -r '.parts[0].url')
+
+ETAG=$(curl -s -X PUT --upload-file myvideo.mp4 "$URL" -D- -o /dev/null \
+       | grep -i '^etag:' | sed 's/.*: *//')
+#      ^ readable ONLY because jamex-raw's CORS ExposeHeaders includes ETag
+
+curl -s -X PUT "localhost:8083/uploads/$UP/parts/1" -H 'Content-Type: application/json' \
+     -H "X-JameX-User: $USER" -d "{\"eTag\":$ETAG}"
+
+curl -s -X POST "localhost:8083/uploads/$UP/complete" -H 'Content-Type: application/json' \
+     -H "X-JameX-User: $USER" -d "{\"parts\":[{\"partNumber\":1,\"eTag\":$ETAG}]}"
+# → status: 1 (Queued). VideoUploaded has just been published.
+
+# poll until Ready — a short clip typically takes single-digit seconds
+watch -n1 "curl -s localhost:8082/videos/$VID | jq '{status,masterPlaylistUrl}'"
+
+# --- play it -----------------------------------------------------------
+# masterPlaylistUrl from the response above, straight into any HLS player:
+ffplay "http://localhost:8090/media/videos/<id>/master.m3u8"
+
+# --- prove the resumability claim ------------------------------------
+# stop mid-upload (kill the client after reporting only some parts), then:
+curl -s "localhost:8083/uploads/$UP" -H "X-JameX-User: $USER" | jq '.uploadedPartNumbers'
+# → only the parts that actually landed. Re-presign and re-send only the rest.
+```
+
+**Or skip all of the above** and use the harness at
+**[localhost:3100](http://localhost:3100)** — file picker, live per-part
+progress, a *Simulate drop* / *Resume* pair that exercises the code above for
+real, and an hls.js player with a manual quality selector.
+
+**Verified, 2026-09-03:**
+
+```
+upload → Ready                 9s  (690 KB test clip, single part)
+upload → Ready                20s  (same clip, fresh user/channel each time)
+FFmpeg ladder, 1280×720 source  4 rungs (240p/360p/480p/720p), 4.6s to encode
+FFmpeg ladder, 3840×2160 source 5 rungs (+1080p), 10.7s to encode
+edge cache                     MISS → HIT confirmed, correct Content-Type
+resumability                   3 concurrent part-record calls, all 3 survived
+idempotent completion          /complete called twice → identical event id both times
+no-upscale fix                 180p source → single 320×180 rendition, not 428×240
+```
+
+**Known local-only failure modes hit during verification** — see §9.10 and
+`PROGRESS.md` for the full detail and recovery steps: SNS→SQS delivery drops
+and consumer wedges under heavy repeated testing, `edge`'s stale upstream DNS
+after a LocalStack recreate, and S3 objects not surviving `docker compose
+down` on the free LocalStack tier. None of these are application defects —
+each was isolated and confirmed by a clean run succeeding immediately after
+the fix.
+
 ---
 
-## 10. Interview talking points
+## 11. Interview talking points
 
 Rehearse these aloud. Each is answerable from what is actually built.
 
@@ -1624,17 +1947,54 @@ change, no new topic, no upstream redeploy. Producers stay ignorant of who
 listens. Filter policies mean a consumer is not even woken for events it does not
 handle.
 
+**"How do you make a large upload resumable?"**
+One DynamoDB item per upload, holding every confirmed part's ETag in a nested
+map. On reconnect the client asks which parts already landed and re-sends only
+the gaps — it never assumes; it asks. The tricky part is recording a part
+safely under concurrency: `UpdateExpression = "SET parts.#n = :etag"` targets
+one key inside the map, so parts uploaded in parallel can never race each
+other into a lost update the way a read-modify-write would.
+
+**"You don't have a database in this service. How do you make completion
+idempotent without one?"**
+Store the event id *with* the state transition, guarded by a condition that
+only the first caller can satisfy. A retry fails that condition, reads back
+the id that already won, and republishes the identical event — which the
+downstream service's inbox then recognises as a duplicate. It's weaker than a
+true transactional outbox (the window narrows rather than closes), but it's
+the strongest guarantee available with no relational store to enrol a claim
+in.
+
+**"How does adaptive bitrate switching actually work under the hood?"**
+Two files types: one master playlist listing every quality with its bandwidth
+and resolution, and one playlist per quality listing that quality's own
+segments. The player reads the master once, picks a quality, and can swap to a
+different quality's playlist at any segment boundary — but only if every
+quality's segments are cut at the *same* timestamps. That alignment is not
+automatic; it requires forcing an identical keyframe interval across every
+encode (`-g`, `-keyint_min`, `-sc_threshold 0`), or the qualities drift apart
+and switching produces a visible stutter.
+
+**"Would you ever upscale a low-resolution source to fill out your quality
+ladder?"**
+No — a rendition taller than the source invents pixels it doesn't have,
+producing a file that is simultaneously larger and blurrier than the original.
+The ladder generation skips any configured rung above the source's own
+resolution, and if the source is smaller than every configured rung, it
+produces exactly one rendition at the source's native size rather than
+upscaling to the smallest configured one.
+
 ---
 
-## 11. Roadmap
+## 12. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | **1** | Local AWS substrate: S3, SQS, DynamoDB, Postgres split, Redis, edge cache | ✅ **Done, verified** |
 | **2** | Service decomposition, contracts, SNS/SQS event bus, gateway, shared plumbing | ✅ **Done, verified** |
 | **3** | Identity + Catalog: EF Core models, migrations, REST APIs, event handlers, inbox + outbox, cache-aside | ✅ **Done, verified** |
-| 4 | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ⬜ Next |
-| 5 | Engagement + Search: sharded counters, reactions, comments, inverted index | ⬜ |
+| **4** | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ✅ **Done, verified** |
+| 5 | Engagement + Search: sharded counters, reactions, comments, inverted index | ⬜ Next |
 | 6 | Gateway BFF aggregation + Next.js frontend with hls.js adaptive player | ⬜ |
 | 7 | `DESIGN.md` — doc-to-code mapping and interview question bank | ⬜ |
 

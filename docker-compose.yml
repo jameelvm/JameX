@@ -93,12 +93,19 @@ services:
       # container straight from your browser. Optional: everything else in
       # this compose file works with it unset.
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
-      # Without this, S3 objects, SQS messages and DynamoDB items live only in
-      # container memory — recreating the container (an image change, a
-      # `docker compose down`, a host reboot) silently empties every bucket
-      # and table while Postgres next to it is untouched. That mismatch is
-      # what happened when this image was upgraded: 6 video rows survived,
-      # 0 of their encoded files did.
+      # Requested, but only partially effective: LocalStack's Persistence
+      # feature (periodic snapshot + restore across restarts) needs a paid
+      # Base/Ultimate plan — this stack runs on the free "freemium" tier, which
+      # does not include it. Verified: DynamoDB items survive a
+      # `docker compose down` / `up` only because its backend happens to keep
+      # its own SQLite file under /var/lib/localstack as an implementation
+      # detail, unrelated to this setting — and that file lands in the mounted
+      # volume by coincidence. S3 keeps no such file on this tier, so every
+      # uploaded and encoded video is wiped on every restart. Postgres, on its
+      # own container and volume, is unaffected either way.
+      #
+      # Left set to "1" — harmless, and becomes real persistence for every
+      # service at once if this ever runs against a paid plan.
       PERSISTENCE: "1"
     ports:
       - "4566:4566"
