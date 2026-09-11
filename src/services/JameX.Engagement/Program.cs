@@ -1,3 +1,6 @@
+using JameX.Engagement;
+using JameX.Engagement.Data;
+using JameX.ServiceDefaults.Data;
 using JameX.ServiceDefaults.Hosting;
 
 // Engagement owns the write-heavy half of the system: sharded view counters and
@@ -12,13 +15,20 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddJameXServiceDefaults(ServiceName);
 builder.AddJameXApiDefaults();
+builder.AddJameXPostgres<EngagementDbContext>("Engagement");
+builder.Services.AddEngagementServices(builder.Configuration);
 
 // Consumes VideoEncoded (initialise counters) and VideoDeleted (drop them).
 builder.Services.AddJameXEventConsumer();
 
 var app = builder.Build();
 
+app.UseJameXExceptionHandling();
 app.UseCors();
+
 app.MapJameXDefaultEndpoints(ServiceName);
+
+// Development convenience only — see MigrateJameXDatabaseAsync.
+await app.MigrateJameXDatabaseAsync<EngagementDbContext>();
 
 app.Run();

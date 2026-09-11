@@ -84,15 +84,13 @@ public sealed class OutboxMessage
 public static class EventTables
 {
     /// <summary>
-    /// Adds the inbox and outbox tables to a service's model.
-    /// <para>
-    /// Shared because every service that both consumes and publishes events
-    /// needs exactly these two, and three different hand-rolled versions would
-    /// be three different sets of bugs. They are infrastructure, not domain —
-    /// which is why they live here rather than in a service's <c>Domain</c>.
-    /// </para>
+    /// Adds the inbox table alone, for a service that consumes events but
+    /// never publishes any of its own — Engagement records a view or a like
+    /// and announces nothing downstream, so an outbox table here would sit
+    /// permanently empty. Split from <see cref="AddJameXEventTables"/> so a
+    /// service takes exactly the infrastructure its role actually needs.
     /// </summary>
-    public static ModelBuilder AddJameXEventTables(this ModelBuilder modelBuilder)
+    public static ModelBuilder AddJameXInboxTable(this ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<ProcessedEvent>(processed =>
         {
@@ -109,6 +107,17 @@ public static class EventTables
             processed.HasIndex(p => p.ProcessedAt).HasDatabaseName("ix_processed_events_processed_at");
         });
 
+        return modelBuilder;
+    }
+
+    /// <summary>
+    /// Adds the outbox table alone. Always paired with
+    /// <see cref="AddJameXInboxTable"/> in practice — a service with an
+    /// outbox still needs to consume its own dependencies idempotently — but
+    /// kept separate so the pairing is a choice at the call site, not baked in.
+    /// </summary>
+    public static ModelBuilder AddJameXOutboxTable(this ModelBuilder modelBuilder)
+    {
         modelBuilder.Entity<OutboxMessage>(outbox =>
         {
             outbox.ToTable("outbox_messages");
@@ -129,4 +138,11 @@ public static class EventTables
 
         return modelBuilder;
     }
+
+    /// <summary>
+    /// Adds both tables — the common case for a service that both consumes
+    /// and publishes events, such as Catalog.
+    /// </summary>
+    public static ModelBuilder AddJameXEventTables(this ModelBuilder modelBuilder) =>
+        modelBuilder.AddJameXInboxTable().AddJameXOutboxTable();
 }

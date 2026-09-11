@@ -39,9 +39,11 @@ and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-03
+**Last updated:** 2026-09-10
 **Phases 1–4: COMPLETE, verified, documented in README.md and DESIGN.md.**
-**Next: Phase 5 — Engagement and Search.**
+**Phase 5 in progress: Module 1 (Engagement data model + counter/reaction
+lifecycle) done and verified. Next: Module 2 (Reaction/View services + REST
+API).**
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
@@ -191,7 +193,64 @@ Rationale kept in `README.md` §"Why seven services".
 
 ### In progress
 
-Nothing. Phase 4 is closed. Start Phase 5.
+**Phase 5 — Engagement and Search.**
+
+- [x] **Module 1 — Engagement data model.** `Comment` (Postgres, `jamex_engagement`)
+      is the only relational entity — comments are read as an ordered, paginated
+      list per video, a relational access pattern unlike the counters next to
+      it. `EngagementDbContext` carries the inbox table only, no outbox:
+      Engagement consumes `VideoEncoded`/`VideoDeleted` but never announces its
+      own changes.
+      `VideoCounterRepository` reaches `jamex-video-counters`: views are split
+      across `ViewShardCount` (10) shards keyed `VIEWS#0`…`VIEWS#9` — chapter
+      4's write-scaling problem made concrete, since a viral video's view
+      counter is the hottest key in the system — while likes/dislikes are a
+      single unsharded row each, because the uniqueness check in
+      `UserReactionRepository` already caps their write rate far below a raw
+      view ping. Both counters use DynamoDB's atomic `ADD`, never
+      read-modify-write.
+      `UserReactionRepository` reaches `jamex-user-reactions`: one row per
+      (user, video) is the entire idempotency mechanism for like/dislike,
+      absence of a row meaning "no reaction" rather than a stored value. A
+      `by-video` GSI supports the `VideoDeleted` teardown without a table
+      scan.
+      `EventTables.cs` in `ServiceDefaults` was split into
+      `AddJameXInboxTable()` / `AddJameXOutboxTable()` / `AddJameXEventTables()`
+      (both) — Engagement is the first service that needs only one of the two.
+      `VideoEncodedHandler` initialises likes/dislikes to zero on a video
+      becoming playable; `VideoDeletedHandler` drops every counter and
+      reaction row. Comments are deliberately left untouched by delete —
+      that decision belongs to the comments module, not this one.
+
+      **The cross-store idempotency gap, closed properly, not just noted:**
+      Postgres has an inbox, but the DynamoDB writes cannot join its
+      transaction — same limitation the Redis deduplicator's remarks describe
+      for Encoder. Claiming the event and committing the inbox row first
+      narrows the redelivery window; it does not close it. What actually
+      closes it is `VideoCounterRepository.InitializeAsync` using a
+      `ConditionExpression: attribute_not_exists(videoId)` instead of a plain
+      `PutItem` — a redelivered `VideoEncoded` becomes a true no-op rather than
+      resetting a counter real traffic has already moved off zero.
+      `DeleteAllAsync`/`DeleteAllForVideoAsync` need no such guard: deleting an
+      already-deleted row is naturally a no-op.
+
+      **Verified against the live stack** (Docker Desktop + LocalStack,
+      messages sent straight to `jamex-engagement-events`, bypassing SNS per
+      the reliability note below): first `VideoEncoded` created
+      likes=0/dislikes=0; an exact redelivery (same event id) was rejected by
+      the inbox with no second Dynamo write; likes bumped to 5 out-of-band via
+      `UpdateItem ADD`, then a *fresh* `VideoEncoded` (new event id, same
+      video) redelivered — likes stayed at 5, proving the conditional guard
+      protects live data even when the inbox can't. `VideoDeleted` then
+      removed both counter rows and a planted reaction row (confirmed via the
+      `by-video` GSI returning zero items).
+
+### Next up (immediate)
+
+Module 2 — the `IReactionService`/`IViewService` application layer and the
+Engagement REST API (like/dislike/unlike, record-a-view, read counters).
+Comments (Module 3+) and the DynamoDB inverted-index vs. Postgres FTS
+comparison for Search come after.
 
 ---
 
