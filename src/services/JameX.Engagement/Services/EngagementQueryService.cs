@@ -13,17 +13,23 @@ public interface IEngagementQueryService
     Task<OperationResult<EngagementCounts>> GetCountsAsync(Guid videoId, CancellationToken ct);
 }
 
-internal sealed class EngagementQueryService(IVideoCounterRepository counters) : IEngagementQueryService
+internal sealed class EngagementQueryService(
+    IVideoCounterRepository counters, ICommentRepository comments) : IEngagementQueryService
 {
     public async Task<OperationResult<EngagementCounts>> GetCountsAsync(Guid videoId, CancellationToken ct)
     {
-        var snapshot = await counters.GetAsync(videoId, ct);
+        // Two independent stores, read in parallel — there is deliberately no
+        // NotFound here even for a video with no rows at all yet: Engagement
+        // does not own video existence, only Catalog does, and a video whose
+        // VideoEncoded has not landed simply reads as zeros.
+        var snapshotTask = counters.GetAsync(videoId, ct);
+        var commentCountTask = comments.CountForVideoAsync(videoId, ct);
 
-        // Comments is 0 until the comments module exists to fill it in — there
-        // is deliberately no NotFound here even for a video with no rows at
-        // all yet: Engagement does not own video existence, only Catalog does,
-        // and a video whose VideoEncoded has not landed simply reads as zeros.
+        await Task.WhenAll(snapshotTask, commentCountTask);
+
+        var snapshot = snapshotTask.Result;
+
         return OperationResult<EngagementCounts>.Success(
-            new EngagementCounts(snapshot.Views, snapshot.Likes, snapshot.Dislikes, Comments: 0));
+            new EngagementCounts(snapshot.Views, snapshot.Likes, snapshot.Dislikes, commentCountTask.Result));
     }
 }

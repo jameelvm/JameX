@@ -39,11 +39,11 @@ and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-11
+**Last updated:** 2026-09-12
 **Phases 1–4: COMPLETE, verified, documented in README.md and DESIGN.md.**
-**Phase 5 in progress: Modules 1–2 done and verified (Engagement data model,
-counter/reaction lifecycle, and the Reaction/View/Counts REST API). Next:
-Module 3 — comments.**
+**Phase 5 in progress: Modules 1–3 done and verified (Engagement data model,
+counter/reaction lifecycle, Reaction/View/Counts REST API, and comments).
+Next: Search's DynamoDB inverted index vs. Postgres FTS comparison.**
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
@@ -277,14 +277,50 @@ Rationale kept in `README.md` §"Why seven services".
       concurrency fix specifically**: fired 10 simultaneous identical
       PUT-Like requests from one user — likes stayed at exactly 1, not 10.
 
+- [x] **Module 3 — comments.** `ICommentRepository` (Postgres, plain
+      `IUnitOfWork` commits — comments have no inbox/outbox involvement of
+      their own beyond sharing the DbContext) backs `ICommentService`, exposed
+      by `CommentsController` under `/videos/{id}/comments`, matching the
+      Gateway's existing `video-comments` route.
+
+      Added a genuine schema change: `Comment.IsDeleted` (new migration
+      `AddCommentIsDeleted`). It exists because the self-referencing
+      `ParentCommentId` foreign key is `Restrict`, not `Cascade` — deleting a
+      top-level comment that still has replies would either violate that
+      constraint or silently orphan the replies. `DeleteAsync` checks
+      `HasRepliesAsync` first: a comment with replies is tombstoned
+      (`IsDeleted = true`, `Text` blanked, row kept so the thread survives) and
+      one with none is removed outright. A reply can never have replies of its
+      own — the one-level-nesting rule enforced in `CommentService.AddAsync`
+      guarantees that — so a reply delete always takes the hard-delete branch.
+      `CommentMapping.ToDto` renders a tombstoned row's text as `[deleted]`
+      without exposing that a soft-delete happened.
+
+      `EngagementQueryService.GetCountsAsync` now reads `Comments` from
+      `ICommentRepository.CountForVideoAsync` (both stores queried in
+      parallel) instead of the hardcoded 0 from Module 2 — counts top-level
+      comments and replies together, tombstones included.
+
+      **Verified against the live stack**, directly and through the Gateway:
+      migration applied cleanly (`ALTER TABLE comments ADD is_deleted...`);
+      posting a top-level comment and a reply to it; a reply-to-a-reply
+      rejected with 400 ("Replies cannot themselves be replied to"); counts
+      read 2 after both; editing rejected for a non-owner (403) and accepted
+      for the owner (`isEdited` flips true); deleting a non-owner's comment
+      rejected (403); **deleting the top-level comment while its reply still
+      existed tombstoned it** — text became `[deleted]`, the row stayed in the
+      top-level list, the reply was still reachable, and the count stayed at
+      2; **deleting the reply itself (a leaf, no children) physically removed
+      it** — it vanished from the replies list and the count dropped to 1;
+      editing a tombstoned comment was rejected with a 400.
+
 ### Next up (immediate)
 
-Module 3 — comments: nesting-depth validation in the service layer (the
-one-level-deep rule `Comment.cs` already documents), the comment REST API
-under `/videos/{id}/comments` (already routed at the Gateway), and wiring
-`EngagementQueryService`'s `Comments` field to a real count instead of the
-hardcoded 0. The DynamoDB inverted-index vs. Postgres FTS comparison for
-Search comes after that.
+Search — the DynamoDB inverted-index vs. Postgres FTS comparison. Comments
+also leaves one open thread worth returning to: a real system would let a
+channel owner moderate comments on their own videos, which Engagement cannot
+authorise today for the same cross-service-ownership reason Catalog cannot
+verify channel ownership (see Open questions below).
 
 ---
 

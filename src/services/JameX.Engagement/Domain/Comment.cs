@@ -33,6 +33,16 @@ public sealed class Comment
     /// </summary>
     public bool IsEdited => UpdatedAt > CreatedAt;
 
+    /// <summary>
+    /// A tombstone, not a physical delete. The self-referencing foreign key is
+    /// <c>Restrict</c> — see <c>EngagementDbContext</c> — so a top-level comment
+    /// with replies cannot simply be removed without orphaning them. Deleting
+    /// one blanks <see cref="Text"/> and sets this instead, which keeps the
+    /// row (and the thread) intact. A reply, which by construction has no
+    /// replies of its own, is removed outright instead of tombstoned.
+    /// </summary>
+    public bool IsDeleted { get; set; }
+
     // No UserDisplayName column, deliberately — Engagement never learned it in
     // the first place. A comment is created from a userId on the caller's
     // identity, not from anything Identity's database holds. The Gateway
