@@ -63,7 +63,7 @@ public sealed class VideoUploadedHandler(
                 new EncodingJob(data.VideoId, sourcePath, outputDirectory), ct);
 
             await UploadLadderAsync(data.VideoId, result, ct);
-            await PublishEncodedAsync(data.VideoId, result, ct);
+            await PublishEncodedAsync(data, result, ct);
         }
         catch (EncodingFailedException ex)
         {
@@ -116,8 +116,10 @@ public sealed class VideoUploadedHandler(
             result.MasterPlaylistPath, _storage.MasterPlaylistKey(videoId), ct);
     }
 
-    private async Task PublishEncodedAsync(Guid videoId, EncodingResult result, CancellationToken ct)
+    private async Task PublishEncodedAsync(VideoUploaded data, EncodingResult result, CancellationToken ct)
     {
+        var videoId = data.VideoId;
+
         var renditions = result.Renditions
             .OrderBy(r => r.BitrateKbps)
             .Select(r => new EncodedRendition(
@@ -141,7 +143,10 @@ public sealed class VideoUploadedHandler(
             thumbnails.FirstOrDefault(t => t.IsPoster)?.ObjectKey,
             result.Provider,
             result.EncodingSeconds,
-            DateTimeOffset.UtcNow), ct);
+            DateTimeOffset.UtcNow,
+            data.Title,
+            data.Description,
+            data.Tags), ct);
 
         Logger.LogInformation(
             "Published VideoEncoded for {VideoId}: {Rungs} rungs in {Seconds:F1}s",

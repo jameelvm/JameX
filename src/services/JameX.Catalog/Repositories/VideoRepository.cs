@@ -46,6 +46,14 @@ public interface IVideoRepository
     /// <summary>Batch resolution for the Gateway, mirroring Identity's endpoints.</summary>
     Task<IReadOnlyList<Video>> GetManyAsync(IReadOnlyCollection<Guid> videoIds, CancellationToken ct);
 
+    /// <summary>
+    /// Title search via <c>pg_trgm</c> — the Postgres half of phase 5's
+    /// inverted-index-vs-FTS comparison. Ranked by trigram similarity,
+    /// restricted to public and Ready, same as the feed.
+    /// </summary>
+    Task<(IReadOnlyList<Video> Items, int Total)> SearchByTitleAsync(
+        string query, int page, int pageSize, CancellationToken ct);
+
     void Add(Video video);
 
     /// <summary>
@@ -132,6 +140,32 @@ internal sealed class VideoRepository(CatalogDbContext db) : IVideoRepository
         return await db.Videos.AsNoTracking()
             .Where(v => ids.Contains(v.Id))
             .ToListAsync(ct);
+    }
+
+    public async Task<(IReadOnlyList<Video> Items, int Total)> SearchByTitleAsync(
+        string query, int page, int pageSize, CancellationToken ct)
+    {
+        // word_similarity, not plain similarity. Plain similarity() compares
+        // the ENTIRE query against the ENTIRE title, so a short query like
+        // "guitar" scores low against a long title purely because the
+        // trigram sets differ so much in size — found by testing this
+        // against a real title, not assumed. word_similarity() instead asks
+        // "does some substring of the title match the query about this
+        // well", which is what a search box actually needs. Still backed by
+        // ix_videos_title_trgm; only the comparison function changes.
+        var candidates = db.Videos.AsNoTracking()
+            .Where(v => v.Privacy == VideoPrivacy.Public && v.Status == VideoStatus.Ready)
+            .Where(v => EF.Functions.TrigramsAreWordSimilar(query, v.Title));
+
+        var total = await candidates.CountAsync(ct);
+
+        var items = await candidates
+            .OrderByDescending(v => EF.Functions.TrigramsWordSimilarity(query, v.Title))
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return (items, total);
     }
 
     public void Add(Video video) => db.Videos.Add(video);

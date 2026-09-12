@@ -71,6 +71,17 @@ public sealed record VideoUploaded(
 /// (indexes the video — nothing unwatchable should be findable), Engagement
 /// (initialises counters).
 /// </para>
+/// <para>
+/// <see cref="Title"/>, <see cref="Description"/> and <see cref="Tags"/> are
+/// carried over verbatim from the <see cref="VideoUploaded"/> that started
+/// this encode — Encoder already has them in hand when it publishes this
+/// event. They exist here purely so Search can index a video without a
+/// synchronous call to Catalog: Search subscribes to this event and
+/// <see cref="VideoDeleted"/> only, so without this the metadata a search
+/// needs to match against would not exist anywhere Search can reach
+/// asynchronously. Same reasoning as why <see cref="VideoUploaded"/> repeats
+/// this data instead of making Catalog look it up.
+/// </para>
 /// </summary>
 public sealed record VideoEncoded(
     Guid VideoId,
@@ -82,7 +93,10 @@ public sealed record VideoEncoded(
     string? PosterThumbnailKey,
     string EncoderProvider,
     double EncodingSeconds,
-    DateTimeOffset EncodedAt);
+    DateTimeOffset EncodedAt,
+    string Title,
+    string? Description,
+    string[] Tags);
 
 /// <summary>One rung of the adaptive bitrate ladder.</summary>
 public sealed record EncodedRendition(

@@ -227,11 +227,21 @@ awslocal dynamodb create-table \
   --billing-mode PAY_PER_REQUEST >/dev/null
 
 # Owner: Search. Inverted index exactly as chapter 3 describes: key is the
-# term, value carries frequency and which field matched.
+# term, value carries frequency and which field matched. The by-video GSI
+# exists for exactly one query: VideoDeleted has a videoId, not a list of
+# terms, and the base table cannot be queried by its range key alone.
 awslocal dynamodb create-table \
   --table-name jamex-search-index \
   --attribute-definitions AttributeName=term,AttributeType=S AttributeName=videoId,AttributeType=S \
   --key-schema AttributeName=term,KeyType=HASH AttributeName=videoId,KeyType=RANGE \
+  --global-secondary-indexes '[{
+    "IndexName": "by-video",
+    "KeySchema": [
+      {"AttributeName": "videoId", "KeyType": "HASH"},
+      {"AttributeName": "term",    "KeyType": "RANGE"}
+    ],
+    "Projection": {"ProjectionType": "KEYS_ONLY"}
+  }]' \
   --billing-mode PAY_PER_REQUEST >/dev/null
 
 # Owner: Ingest. Which parts of a multipart upload have landed, so a dropped

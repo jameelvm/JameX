@@ -29,6 +29,9 @@ public interface IVideoQueryService
     Task<OperationResult<PagedResult<VideoSummary>>> GetFeedAsync(int page, int pageSize, CancellationToken ct);
     Task<OperationResult<PagedResult<VideoSummary>>> GetByChannelAsync(Guid channelId, int page, int pageSize, CancellationToken ct);
     Task<OperationResult<IReadOnlyList<VideoSummary>>> GetBatchAsync(IReadOnlyList<Guid> ids, CancellationToken ct);
+
+    /// <summary>The Postgres FTS half of the phase 5 comparison — see <c>IVideoRepository.SearchByTitleAsync</c>.</summary>
+    Task<OperationResult<PagedResult<VideoSummary>>> SearchAsync(string query, int page, int pageSize, CancellationToken ct);
 }
 
 internal sealed class VideoQueryService(
@@ -125,5 +128,21 @@ internal sealed class VideoQueryService(
 
         return OperationResult<IReadOnlyList<VideoSummary>>.Success(
             found.Select(v => v.ToSummary(_storage)).ToArray());
+    }
+
+    public async Task<OperationResult<PagedResult<VideoSummary>>> SearchAsync(
+        string query, int page, int pageSize, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return OperationResult<PagedResult<VideoSummary>>.Invalid("q", "A search query is required.");
+
+        page = CatalogRules.NormalisePage(page);
+        pageSize = CatalogRules.NormalisePageSize(pageSize);
+
+        var (items, total) = await videos.SearchByTitleAsync(query, page, pageSize, ct);
+
+        return OperationResult<PagedResult<VideoSummary>>.Success(
+            new PagedResult<VideoSummary>(
+                items.Select(v => v.ToSummary(_storage)).ToArray(), total, page, pageSize));
     }
 }

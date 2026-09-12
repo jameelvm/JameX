@@ -259,6 +259,7 @@ services:
     environment:
       <<: *service-env
       Messaging__QueueName: "jamex-search-events"
+      CatalogClient__BaseUrl: "http://catalog:8080"
 
   encoder:
     <<: *service-base

@@ -68,6 +68,22 @@ public sealed class VideosController(
         (await videoQueryService.GetByChannelAsync(channelId, page, pageSize, ct)).ToActionResult();
 
     /// <summary>
+    /// Title search via Postgres trigram similarity — the FTS half of phase
+    /// 5's comparison against Search's DynamoDB inverted index. Synchronous
+    /// and always fresh, unlike Search's async, eventually-consistent index,
+    /// because Catalog already owns this data outright.
+    /// </summary>
+    [HttpGet("search")]
+    [ProducesResponseType<PagedResult<VideoSummary>>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> Search(
+        [FromQuery] string q,
+        CancellationToken ct,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = CatalogRules.DefaultPageSize) =>
+        (await videoQueryService.SearchAsync(q, page, pageSize, ct)).ToActionResult();
+
+    /// <summary>
     /// Resolves many videos in one call, mirroring Identity's batch endpoints —
     /// the Gateway needs all three services to support this or the watch page
     /// degenerates into one request per item.

@@ -1,3 +1,4 @@
+using JameX.Search;
 using JameX.ServiceDefaults.Hosting;
 
 // Search owns the inverted index described in chapter 3: term -> videos, with
@@ -13,6 +14,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddJameXServiceDefaults(ServiceName);
 builder.AddJameXApiDefaults();
+builder.Services.AddSearchServices(builder.Configuration);
 
 // Consumes VideoEncoded (index it — nothing unplayable should be findable)
 // and VideoDeleted (remove it).
@@ -20,6 +22,7 @@ builder.Services.AddJameXEventConsumer();
 
 var app = builder.Build();
 
+app.UseJameXExceptionHandling();
 app.UseCors();
 app.MapJameXDefaultEndpoints(ServiceName);
 
