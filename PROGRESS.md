@@ -40,10 +40,8 @@ and *Next up* sections at the end of every session.
 ## Current state
 
 **Last updated:** 2026-09-12
-**Phases 1–4: COMPLETE, verified, documented in README.md and DESIGN.md.**
-**Phase 5 in progress: Modules 1–3 done and verified (Engagement data model,
-counter/reaction lifecycle, Reaction/View/Counts REST API, and comments).
-Next: Search's DynamoDB inverted index vs. Postgres FTS comparison.**
+**Phases 1–5: COMPLETE, verified, documented in README.md and DESIGN.md.**
+**Next: Phase 6 — Gateway BFF aggregation + Next.js frontend.**
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
@@ -314,13 +312,146 @@ Rationale kept in `README.md` §"Why seven services".
       it** — it vanished from the replies list and the count dropped to 1;
       editing a tombstoned comment was rejected with a 400.
 
+- [x] **Search — inverted index data model and event handlers.** `Tokenizer`
+      (lowercase, split on runs of Unicode letters/digits, count occurrences —
+      deliberately no stemming, no stopword removal, no synonyms; the doc's
+      honest limits are the point) backs `ISearchIndexRepository` over
+      `jamex-search-index`: `IndexAsync` tokenizes title/description/tags,
+      merges a term's occurrences across all three fields into one posting
+      (summed frequency, tagged with the highest-priority field it appeared
+      in — title beats tags beats description), and writes via
+      `BatchWriteItem`. `SearchAsync` fans a multi-term query out to one
+      `Query` per term (each a single-partition read) and intersects the
+      results in memory — AND semantics, matching chapter 3's description
+      exactly. `DeleteAllForVideoAsync` needed a new **`by-video` GSI** on
+      `jamex-search-index` (table dropped and recreated locally, since it held
+      no data yet) — the base table is keyed by term first, so finding every
+      posting for one video is impossible without it, the identical problem
+      `UserReactionRepository`'s `by-video` GSI solves in Engagement.
+
+      **A real contract gap, found and fixed, not routed around:** Search
+      subscribes only to `VideoEncoded`/`VideoDeleted`, but `VideoEncoded`
+      carried none of title/description/tags — only Encoder's technical
+      output. Adding a synchronous HTTP call to Catalog was the tempting fix
+      but wrong: it would make Search's otherwise fully event-driven,
+      failure-isolated design depend on Catalog being reachable just to
+      process a queue message. Instead `VideoEncoded` now carries `Title`,
+      `Description` and `Tags`, sourced from the original `VideoUploaded`
+      Encoder already has in hand when it publishes — the same "denormalize
+      into the event" reasoning `VideoUploaded` itself already uses. One
+      construction site changed (`Encoder/EventHandlers/VideoUploadedHandler`);
+      every consumer deserializes by property name, so nothing else moved.
+
+      `VideoEncodedHandler` uses the Redis `IEventDeduplicator`, not an inbox
+      — Search owns no relational store, same as Encoder — but leans on
+      `IndexAsync` being a plain overwrite of deterministic content, so a
+      redelivery can never corrupt anything even if the Redis filter misses.
+      `VideoDeletedHandler` needs no dedup at all: deleting rows that are
+      already gone is a no-op.
+
+      **Verified against the live stack**: two videos indexed with an
+      overlapping term ("guitar", frequency 3 = 1 title + 1 description + 1
+      tag occurrence, correctly tagged field=`title`); `VideoDeleted` for one
+      video removed every one of its postings via the `by-video` GSI while
+      leaving the other video's postings untouched — confirmed a
+      video-unique term vanished entirely and the shared term still showed
+      exactly one remaining posting.
+
+- [x] **Search — REST API with cross-service hydration.** `GET /search?q=&limit=`
+      (`SearchController` → `ISearchQueryService` → `ISearchIndexRepository`)
+      returns `SearchHit[]` (already in `JameX.Contracts.Dtos` — `Title`,
+      `ThumbnailUrl`, `DurationSeconds`, `PublishedAt` are all Catalog-owned
+      fields Search has no way to answer from its own store).
+
+      **The one deliberate exception to "services never call each other
+      synchronously" in this codebase:** `ICatalogClient` makes a real HTTP
+      call from Search to Catalog (`POST /videos/batch`) to hydrate postings
+      into full result cards. Distinguished explicitly from the
+      `VideoEncoded`-carries-title/description/tags fix in the previous
+      module: that was an async queue consumer, where a synchronous
+      dependency on Catalog's uptime would have coupled two services'
+      availability for no reason. A search *request* is different — the
+      caller is already synchronously blocked on this HTTP response, so one
+      more HTTP hop costs nothing structurally that wasn't already being
+      paid. `CatalogClient` degrades a Catalog outage to "no results" (logs a
+      warning, returns empty) rather than a 500 — the index itself stays
+      intact either way.
+
+      Ranking is `SearchAsync`'s summed term frequency, unchanged from the
+      previous module — `MatchedOn` reports the exact terms extracted from
+      the query, not a re-derived guess. A video indexed but hydrated to
+      nothing (Catalog no longer has it) is silently dropped from results
+      rather than shown with holes.
+
+      **Verified against the live stack, the full real pipeline**: published
+      a genuine `VideoUploaded` + `VideoEncoded` pair to Catalog's own queue
+      (creating a real, Ready video with real title/description/tags) and the
+      same `VideoEncoded` to Search's queue; `GET /search?q=jazz+piano`
+      returned the video fully hydrated (real title, real CDN thumbnail URL,
+      real duration/publishedAt, correct summed score); `q=jazz+guitar`
+      (AND semantics, one non-matching term) returned empty; a tags-only term
+      matched with the correct lower score; a missing `q` returned 400;
+      deleting the video through Catalog's real API relayed `VideoDeleted`
+      through the outbox and the video vanished from Search's results —
+      confirming the full pipeline, not just the DynamoDB layer in isolation.
+
+- [x] **Catalog — Postgres trigram title search, closing the comparison.**
+      `IVideoRepository.SearchByTitleAsync` reuses the `ix_videos_title_trgm`
+      GIN index the schema had already been carrying since phase 3, restricted
+      to public and Ready, same as the feed. Exposed as `GET
+      /videos/search?q=&page=&pageSize=`, reachable through the Gateway
+      automatically — it falls inside the existing `/api/videos/{**catch-all}`
+      catalog route, so no Gateway config changed.
+
+      **A real tuning finding, not assumed:** the first version used
+      `pg_trgm`'s plain `%`/`similarity()` — and a single-word query like
+      "guitar" scored too low to match a real title ("Guitar Solo Techniques
+      for Rock") and returned nothing. `similarity()` compares the *entire*
+      two strings, so a short query against a long title is penalised purely
+      by the size mismatch in their trigram sets, independent of whether the
+      word is actually present. Switched to `word_similarity()`
+      (`EF.Functions.TrigramsAreWordSimilar`/`TrigramsWordSimilarity`), which
+      asks "does some substring of the title match the query this well" —
+      the question a search box actually needs answered. Still backed by the
+      same GIN index; only the comparison function changed.
+
+      **This is what makes the two engines' trade-offs concrete, not
+      asserted:** Postgres FTS is synchronous and always fresh (Catalog
+      already owns the data, no event lag) and typo-tolerant (trigram
+      similarity has no notion of "exact token"); the DynamoDB inverted index
+      is eventually consistent and exact-token-only, but supports real
+      multi-term AND queries with a frequency-based relevance signal that
+      trigram similarity does not provide at all.
+
+      **Verified against the live stack**: three real public/Ready videos
+      created through the genuine `VideoUploaded`→`VideoEncoded` pipeline;
+      exact-phrase search found the right video; **a misspelled query
+      ("improvisaton" — missing a letter) still found "Jazz Piano
+      Improvisation Lesson"**, something the DynamoDB inverted index cannot
+      do at all since it matches exact tokens only; a single-word query
+      against a longer title matched correctly after the `word_similarity`
+      fix; a nonsense query returned zero results; a missing `q` returned 400.
+
+- [x] **Documentation.** `README.md` grew §10 (Phase 5 — Engagement and
+      Search, eleven subsections covering both stores, sharded counters,
+      atomic reactions, comment tombstoning, the cross-store idempotency
+      fix, the inverted index, the `VideoEncoded` contract fix, the one
+      synchronous cross-service call, and the trigram FTS comparison), a
+      Phase 5 verification block in §11, seven new interview talking points
+      in §12, and an updated §13 roadmap. `DESIGN.md` got §3.7 (seven new
+      decision-register entries), six new failure-mode rows, a new "Search
+      and engagement" question-bank section, and an updated coverage map
+      (three rows moved from Designed/⬜ to Strong/✅).
+
 ### Next up (immediate)
 
-Search — the DynamoDB inverted-index vs. Postgres FTS comparison. Comments
-also leaves one open thread worth returning to: a real system would let a
-channel owner moderate comments on their own videos, which Engagement cannot
-authorise today for the same cross-service-ownership reason Catalog cannot
-verify channel ownership (see Open questions below).
+**Phase 5 is closed.** Start Phase 6 — Gateway BFF aggregation (the watch
+page composed from Catalog + Engagement + Identity in one call) and the
+Next.js frontend with hls.js. Comments still leaves one open thread worth
+returning to there or later: a real system would let a channel owner
+moderate comments on their own videos, which Engagement cannot authorise
+today for the same cross-service-ownership reason Catalog cannot verify
+channel ownership (see Open questions below).
 
 ---
 
@@ -332,11 +463,14 @@ Ordered. Each phase leaves the build green **and** updates `README.md`.
 2. ~~Service restructure and event bus~~ — done.
 3. ~~Identity and Catalog~~ — done.
 4. ~~Ingest and Encoder~~ — done. The pipeline is playable end to end.
-5. **Engagement and Search** — sharded view counters, idempotent reactions,
-   comments; DynamoDB inverted index plus a Postgres FTS comparison.
+5. ~~Engagement and Search~~ — done. Sharded view counters, idempotent
+   reactions, comments; DynamoDB inverted index plus a Postgres trigram FTS
+   comparison. `README.md` §10 and `DESIGN.md` §3.7 written and current.
 6. **Gateway and frontend** — BFF aggregation for the watch page; Next.js with
    hls.js showing live rendition switching, resumable upload UI.
-7. **DESIGN.md** — doc-to-code mapping and the interview question bank.
+7. **DESIGN.md** — deeper doc-to-code mapping, once phase 6 gives the Gateway
+   something real to map. The decision register, failure-mode table and
+   question bank are current through phase 5 already.
 
 ---
 

@@ -27,9 +27,10 @@ playback. A real video goes from upload to playable HLS in under 20 seconds.
 7. [Phase 2 — the service architecture](#7-phase-2--the-service-architecture)
 8. [Phase 3 — Identity and Catalog](#8-phase-3--identity-and-catalog)
 9. [Phase 4 — Ingest and Encoder](#9-phase-4--ingest-and-encoder)
-10. [Verification](#10-verification)
-11. [Interview talking points](#11-interview-talking-points)
-12. [Roadmap](#12-roadmap)
+10. [Phase 5 — Engagement and Search](#10-phase-5--engagement-and-search)
+11. [Verification](#11-verification)
+12. [Interview talking points](#12-interview-talking-points)
+13. [Roadmap](#13-roadmap)
 
 ---
 
@@ -1573,7 +1574,241 @@ bug; a browser does immediately.
 
 ---
 
-## 10. Verification
+## 10. Phase 5 — Engagement and Search
+
+Phase 4 made a video playable. Phase 5 makes it a *YouTube* video: a view
+count, a like button, a comment thread, and a way to find it again — plus the
+one deliberate detour of building the same search feature two different ways,
+so the trade-off between them is something you can point at instead of just
+recite.
+
+### 10.1 What exists now
+
+| | Engagement | Search |
+|---|---|---|
+| Owns | `jamex_engagement` (Postgres, comments only), `jamex-video-counters` + `jamex-user-reactions` (DynamoDB) | `jamex-search-index` (DynamoDB) |
+| Endpoints | 8 (`/videos/{id}/counts`, `/views`, `/reactions/me`, `/videos/{id}/comments/...`) | 1 (`GET /search`) |
+| Publishes | — | — |
+| Consumes | `VideoEncoded`, `VideoDeleted` | `VideoEncoded`, `VideoDeleted` |
+
+Catalog also grew one endpoint this phase — `GET /videos/search` — which is
+where the second search engine actually lives; see §10.10.
+
+### 10.2 One service, two stores, because the access patterns genuinely differ
+
+Engagement's comments are read as an ordered, paginated list per video — a
+relational access pattern. Its counters and reactions are read by direct key
+lookup only, at far higher volume. Rather than force both into one store,
+`EngagementDbContext` (Postgres) holds `comments` and the inbox only, while
+`IVideoCounterRepository` and `IUserReactionRepository` reach DynamoDB
+directly. This is the same split the design doc draws between the metadata
+database and the counter store, just inside one service instead of two.
+
+One consequence worth naming: `EngagementDbContext` has an inbox but **no
+outbox** — split out of the shared `EventTables` helper as
+`AddJameXInboxTable()`/`AddJameXOutboxTable()`/`AddJameXEventTables()`, the
+first service that needed only one of the two. Engagement consumes events but
+never announces its own changes; a like or a view has no downstream
+consumer.
+
+### 10.3 Sharded view counters — the write-scaling story made concrete
+
+A single DynamoDB item caps out around 1,000 writes/sec. A viral video's view
+counter is the hottest key in the entire system and will blow through that on
+one row. The fix is chapter 4's headline write-scaling pattern: split the
+counter into `ViewShardCount` (10) items —
+
+```
+videoId=abc, counterKey=VIEWS#0 → value: 1050
+videoId=abc, counterKey=VIEWS#3 → value: 980
+videoId=abc, counterKey=VIEWS#7 → value: 1102
+```
+
+— and pick one at random per write. `RecordViewAsync` never checks whether its
+chosen shard exists first; DynamoDB's `ADD` auto-vivifies an absent item, so
+there's nothing to pre-allocate. A video with three views might have hit only
+two of ten shards, and `GetAsync` handles that correctly by summing whatever
+rows actually exist rather than assuming all ten are present. The read side
+pays for this: one video's counters means one `Query` returning up to ten
+rows instead of one, and getting a video's total requires summing them in
+application memory.
+
+Likes and dislikes are deliberately **not** sharded. A like requires a unique
+reaction row per user first (§10.4), and that uniqueness check already caps
+the write rate for one video's likes far below what an anonymous,
+unauthenticated view ping can reach — sharding here would add read-side cost
+for a write-side problem that doesn't exist.
+
+### 10.4 Idempotent reactions — the atomic swap that a read-then-write can't do safely
+
+One row per (user, video) in `jamex-user-reactions` is the entire idempotency
+mechanism for like/dislike: its mere existence, not a stored "none" value, is
+what makes absence mean "hasn't reacted." Deciding what a reaction
+*transition* means for the counters — first like, switch from dislike to
+like, remove a like — sounds like it needs a read first: look up the current
+reaction, then decide which counters to adjust.
+
+That read-then-write is a real race. Two concurrent clicks from the same user
+could both read "no reaction" and both increment the likes counter,
+double-counting one person. The fix is `PutItem`/`DeleteItem` with
+`ReturnValues=ALL_OLD` — DynamoDB's own atomic "tell me what this replaced,"
+so learning the previous reaction and writing the new one happen as one
+server-side step. Verified by firing **ten truly concurrent identical
+"like" requests** from one user: the counter landed at exactly 1.
+
+### 10.5 Comments — a tombstone, not a cascade
+
+`comments.parent_comment_id` is a self-referencing foreign key set to
+`Restrict`, not `Cascade`. That is a deliberate choice: deleting a top-level
+comment that still has replies cannot simply remove the row without either
+violating the constraint or orphaning every reply underneath it. `Comment`
+carries an `IsDeleted` tombstone flag for exactly this case —
+
+```
+HasRepliesAsync(commentId)?
+    true  → IsDeleted = true, Text = ""   (row stays, thread survives, renders as "[deleted]")
+    false → row physically removed
+```
+
+A reply can never itself have replies — the one-level-nesting rule is
+enforced in `CommentService.AddAsync`, not the schema, because a
+self-referencing foreign key cannot express "at most one level deep" on its
+own — so deleting a reply always takes the simple removal path.
+
+### 10.6 The cross-store idempotency gap, closed rather than just documented
+
+Postgres has a real inbox: claim an event id and apply its effect in one
+transaction, so a redelivery is rejected atomically by a primary key. The
+DynamoDB writes in this service **cannot join that transaction** — there is
+no way to make "mark this event processed" and "write to Dynamo" atomic
+across two different databases. Claiming the event first only narrows the
+window; a crash between the two writes is still possible.
+
+What actually closes it is making the DynamoDB write itself safe to repeat.
+`VideoEncodedHandler` initialises a fresh video's likes/dislikes to zero using
+a `PutItem` conditioned on `attribute_not_exists(videoId)` rather than a
+plain overwrite — so a redelivered `VideoEncoded` is a genuine no-op even if
+real likes have already landed. Verified by bumping a video's likes to 5
+out-of-band, then replaying `VideoEncoded` with a fresh event id: likes
+stayed at 5. `DeleteAllAsync`/`DeleteAllForVideoAsync` need no such guard —
+deleting rows that are already gone is naturally idempotent.
+
+### 10.7 Search's inverted index — tokenize, merge, fan out, intersect
+
+`jamex-search-index` is chapter 3's inverted index, keyed exactly as
+specified: `term` (partition) → `videoId` (sort), carrying `frequency` and
+which `field` the term matched on. `Tokenizer` is deliberately the simplest
+thing that works — lowercase, split on runs of Unicode letters/digits, count
+occurrences — with no stemming, no stopword removal, no synonyms. Naming
+those gaps instead of hiding them is the honest half of the comparison this
+phase makes.
+
+**Indexing** merges a term's occurrences across title, description and tags
+into a single row: frequency summed across all three fields, tagged with
+whichever field ranks highest (title beats tags beats description). A term
+appearing in the title, description, *and* tags of one video produces one row
+with frequency 3, not three rows.
+
+**Searching** is the doc's stated cost of this design made concrete — there
+is no single query that answers "which videos match all these terms":
+
+```
+Query(term="guitar")   → {Video1: freq 3, Video2: freq 3}    ← one partition read
+Query(term="acoustic") → {Video1: freq 1}                     ← one partition read
+                        ────────────────────────────────────
+intersect               → Video1 only (matched BOTH terms)
+```
+
+AND semantics, not "any word matches": a video that hits every term *except
+one* is dropped entirely, ranked by summed frequency across the terms it did
+match. `DeleteAllForVideoAsync` needed a **new `by-video` GSI** — the base
+table is keyed by term first, so finding every posting for one video is
+otherwise impossible, the identical problem Engagement's reaction teardown
+solves the same way.
+
+### 10.8 A real contract gap: `VideoEncoded` didn't carry what Search needed
+
+Search subscribes to `VideoEncoded`/`VideoDeleted` only — but `VideoEncoded`
+originally carried nothing except Encoder's technical output (bitrates,
+playlist keys, duration). No title, no description, no tags: nothing to
+index.
+
+The tempting fix was a synchronous call from `VideoEncodedHandler` to
+Catalog's read API. That would have been wrong: it makes an otherwise fully
+event-driven, failure-isolated queue consumer's success depend on a second
+service being reachable, purely to process one message. The actual fix
+extends `VideoEncoded` to carry `Title`, `Description` and `Tags`, sourced
+from the original `VideoUploaded` that Encoder already has in hand when it
+publishes — the identical "denormalise into the event" reasoning
+`VideoUploaded` itself already uses, so a consumer never needs a callback to
+act.
+
+### 10.9 The one synchronous service-to-service call in this codebase
+
+`GET /search` cannot answer with just a video id and a score — a search
+result needs a title, a thumbnail, a duration. Search doesn't own any of
+that. `ICatalogClient` makes a real HTTP call to Catalog's `POST
+/videos/batch` to hydrate postings into full result cards.
+
+This is deliberately inconsistent with §10.8's fix, and the inconsistency is
+the point: a *request* is different from a *queue consumer*. The browser is
+already synchronously blocked on this HTTP response, so one more HTTP hop
+costs nothing structurally that wasn't already being paid — whereas an async
+handler blocking on Catalog's uptime would turn one service's outage into
+two. `CatalogClient` degrades a Catalog outage to "no results" rather than a
+500; the index itself stays intact either way.
+
+### 10.10 Catalog's other search engine — Postgres trigram similarity
+
+`ix_videos_title_trgm`, a GIN index on `Video.Title` using `gin_trgm_ops`, has
+existed since phase 3 specifically for this comparison. `GET
+/videos/search?q=` queries it directly — no event handler, no second store,
+no indexing step, because Catalog already owns this data and keeps it fresh
+on every write. It's reachable through the Gateway with **no routing
+change**: it falls inside the existing `/api/videos/{**catch-all}` route.
+
+**A real tuning finding, not assumed.** The first version used `pg_trgm`'s
+plain `similarity()` (the `%` operator) — and a one-word query like "guitar"
+scored too low to match a real title, *"Guitar Solo Techniques for Rock."*
+`similarity()` compares two entire strings, so a six-letter query against a
+thirty-character title is penalised by the size mismatch alone, independent
+of whether the word is actually present. Switched to `word_similarity()`
+(`EF.Functions.TrigramsAreWordSimilar` / `TrigramsWordSimilarity`), which asks
+"does *some part* of the title match this query" — the question a search box
+actually needs answered, still backed by the same GIN index.
+
+**What this buys, verified directly against the DynamoDB side's limits:** a
+misspelled query — `"improvisaton"`, missing a letter — still found *"Jazz
+Piano Improvisation Lesson."* The inverted index in §10.7 cannot do this at
+all: it matches exact tokens, and a misspelled token is simply a different,
+unindexed word.
+
+| | Search (DynamoDB) | Catalog (Postgres) |
+|---|---|---|
+| Consistency | Eventually consistent — async, via events | Always fresh — same store as the source |
+| Query model | Exact tokens, multi-term AND | Fuzzy substring, typo-tolerant |
+| `"improvisaton"` (typo) | No match | Matches |
+| Relevance signal | Summed term frequency | String similarity score |
+| Availability coupling | None until a search request needs hydration | None — self-contained |
+
+### 10.11 What phase 5 does not do
+
+- **No comment moderation by the channel owner.** Engagement can only verify
+  the *comment's* author, because that's the only ownership fact it holds;
+  whether the caller owns the *channel* the video belongs to lives in
+  Identity, the same cross-service-ownership gap Catalog already has for
+  video writes.
+- **No anti-abuse throttling on view pings.** `RecordViewAsync` has no
+  uniqueness check at all — deliberately, since a raw view ping is meant to
+  be cheap and anonymous — so nothing stops a refresh loop or a bot inflating
+  a count. A real system gates this behind a minimum watch time and a
+  per-viewer cooldown.
+- **No stemming, synonyms, or phrase search on either engine.** Named, not
+  hidden — see §10.7 and §10.10.
+
+---
+
+## 11. Verification
 
 Everything below was run and passed on 2026-08-07.
 
@@ -1811,9 +2046,90 @@ down` on the free LocalStack tier. None of these are application defects —
 each was isolated and confirmed by a clean run succeeding immediately after
 the fix.
 
+### Phase 5 — Engagement and Search
+
+```bash
+# --- Engagement: counters + reactions, direct against the queue -----------
+# VideoEncoded initialises counters (see §10.6 for why the write is
+# conditioned rather than a plain PutItem)
+send() { docker exec jamex-localstack awslocal sqs send-message --queue-url "$1" \
+  --message-body "file://$2" --message-attributes "{\"eventType\":{\"DataType\":\"String\",\"StringValue\":\"$3\"}}"; }
+
+Q=$(docker exec jamex-localstack awslocal sqs get-queue-url \
+      --queue-name jamex-engagement-events --query QueueUrl --output text)
+send "$Q" /tmp/encoded.json VideoEncoded
+
+docker exec jamex-localstack awslocal dynamodb query \
+  --table-name jamex-video-counters --key-condition-expression "videoId = :v" \
+  --expression-attribute-values "{\":v\":{\"S\":\"$VIDEO\"}}"
+# → LIKES=0, DISLIKES=0
+
+# --- Engagement: the REST API ----------------------------------------------
+curl -s http://localhost:8084/videos/$VIDEO/counts
+# → {"views":0,"likes":0,"dislikes":0,"comments":0}
+
+curl -X PUT -H "X-JameX-User: $USER" -H 'Content-Type: application/json' \
+     -d '{"kind":0}' http://localhost:8084/videos/$VIDEO/reactions/me   # Like
+curl -X PUT -H "X-JameX-User: $USER" -H 'Content-Type: application/json' \
+     -d '{"kind":1}' http://localhost:8084/videos/$VIDEO/reactions/me   # switch to Dislike
+
+# fire 10 concurrent identical likes from the SAME user
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -X PUT -H "X-JameX-User: $USER" -H 'Content-Type: application/json' \
+       -d '{"kind":0}' http://localhost:8084/videos/$VIDEO/reactions/me &
+done; wait
+curl -s http://localhost:8084/videos/$VIDEO/counts   # → likes:1, not 10
+
+# --- Engagement: comments, the tombstone path ------------------------------
+TOP=$(curl -s -X POST -H "X-JameX-User: $USER" -H 'Content-Type: application/json' \
+      -d '{"text":"first!"}' http://localhost:8084/videos/$VIDEO/comments | jq -r .commentId)
+curl -X POST -H "X-JameX-User: $OTHER" -H 'Content-Type: application/json' \
+     -d "{\"text\":\"welcome\",\"parentCommentId\":\"$TOP\"}" \
+     http://localhost:8084/videos/$VIDEO/comments
+
+curl -X DELETE -H "X-JameX-User: $USER" http://localhost:8084/videos/$VIDEO/comments/$TOP
+curl -s http://localhost:8084/videos/$VIDEO/comments
+# → text: "[deleted]" — the row survives because the reply still points at it
+
+# --- Search: the inverted index, direct against the queue ------------------
+SQ=$(docker exec jamex-localstack awslocal sqs get-queue-url \
+       --queue-name jamex-search-events --query QueueUrl --output text)
+send "$SQ" /tmp/encoded_with_metadata.json VideoEncoded
+
+curl -s "http://localhost:8085/search?q=jazz+piano"
+curl -s "http://localhost:8085/search?q=jazz+guitar"   # one non-matching term → []
+
+# --- Catalog: the other search engine --------------------------------------
+curl -s "http://localhost:8082/videos/search?q=jazz+piano"
+curl -s "http://localhost:8082/videos/search?q=improvisaton"   # typo, missing a letter
+```
+
+**Verified, 2026-09-12:**
+
+```
+counter init                   VideoEncoded → likes=0, dislikes=0; redelivery is a no-op
+race condition                 10 concurrent identical PUT-Like calls, one user → likes=1
+reaction switch                Like→Dislike in one call: likes 1→0, dislikes 0→1
+comment tombstone               deleting a comment WITH a live reply → text="[deleted]", reply
+                                and count both survive; deleting a leaf reply hard-deletes it
+comment nesting                reply-to-a-reply rejected: 400 "cannot themselves be replied to"
+inverted index                 two videos sharing "guitar" (freq 3 each) indexed correctly;
+                                VideoDeleted removed only the deleted video's postings
+inverted index, AND semantics  "jazz guitar" (one non-matching term) → [] even with a partial hit
+cross-service hydration        GET /search returned real title/thumbnail/duration from Catalog
+                                via a live HTTP call, not just a videoId
+full pipeline                  real VideoUploaded → VideoEncoded reached Catalog AND Search;
+                                deleting through Catalog's API relayed VideoDeleted through the
+                                outbox and cleared Search's index
+trigram typo tolerance         "improvisaton" (misspelled) matched "...Improvisation Lesson" —
+                                the DynamoDB inverted index cannot do this at all
+word_similarity fix            plain similarity() missed a real single-word title match;
+                                word_similarity() found it, same GIN index
+```
+
 ---
 
-## 11. Interview talking points
+## 12. Interview talking points
 
 Rehearse these aloud. Each is answerable from what is actually built.
 
@@ -1984,9 +2300,67 @@ resolution, and if the source is smaller than every configured rung, it
 produces exactly one rendition at the source's native size rather than
 upscaling to the smallest configured one.
 
+**"A user double-clicks Like. How do you stop the counter incrementing
+twice?"**
+The reaction write itself reports what it replaced, atomically —
+`PutItem`/`DeleteItem` with `ReturnValues=ALL_OLD` — so the counter
+adjustment is computed *after* the write commits, not decided from a
+separate read beforehand. A plain "read the current reaction, then decide"
+races: two concurrent writes can both read "no reaction" and both increment.
+Verified with ten truly concurrent identical requests landing at exactly one.
+
+**"You have an at-least-once consumer with no relational database to put an
+inbox in. How do you stay safe?"**
+Two layers. Redis narrows the redelivery window the same way it does for
+Encoder, but the real guarantee is making the write itself idempotent: a
+DynamoDB `PutItem` conditioned on `attribute_not_exists` turns "initialise
+this counter" into a genuine no-op on redelivery, rather than resetting real
+activity back to zero. Deletes need no such guard — removing an
+already-removed row is naturally safe.
+
+**"A comment has replies. What happens when the author deletes it?"**
+It's tombstoned, not removed: the text is blanked and a flag is set, but the
+row stays so the reply chain doesn't point at nothing. The alternative —
+cascading the delete to every reply — silently destroys other people's
+comments to satisfy one person's delete. The schema itself enforces the
+boundary: the self-referencing foreign key is `Restrict`, not `Cascade`,
+which is what makes "just delete it" fail loudly instead of quietly
+cascading.
+
+**"Why does one event carry data a downstream consumer 'shouldn't' need,
+like a video's title landing in an encoding-completion event?"**
+Because the alternative is a synchronous call from an async queue consumer
+to fetch it, which couples that consumer's success to a second service being
+up — for one message. Denormalising the field into the event is cheap and
+keeps every consumer able to act alone. The same system also makes a real
+synchronous call elsewhere (search-result hydration) — the difference is
+whether a human is already synchronously waiting on the response. If yes,
+one more HTTP hop costs nothing new; if it's a background handler, it does.
+
+**"Walk me through building an inverted index by hand."**
+Key on the term, not the document: `term → videoId → frequency`. Indexing
+tokenizes every field and writes one row per distinct term. Searching one
+word is one partition read. Searching several words has no single query that
+answers it — you query each term's partition independently and intersect the
+result sets in application memory, keeping only documents that matched
+*every* term. Deleting a document needs a secondary index keyed the other
+way around, because the base table can't be queried by document id alone.
+
+**"When would you pick full-text search over an inverted index you built
+yourself, or the other way round?"**
+If the source data already lives in a relational database you own outright,
+FTS there is nearly free and always consistent — no event lag, no second
+store. Reach for a purpose-built inverted index (or, in production, a real
+search engine like OpenSearch) when write volume would overwhelm that
+database, or a service other than the data's owner needs to serve the
+queries. In this build the two sit side by side deliberately, to make the
+trade-off demonstrable: exact-token AND-matching with no typo tolerance on
+one side, typo-tolerant substring matching with no multi-term boolean logic
+on the other.
+
 ---
 
-## 12. Roadmap
+## 13. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -1994,8 +2368,8 @@ upscaling to the smallest configured one.
 | **2** | Service decomposition, contracts, SNS/SQS event bus, gateway, shared plumbing | ✅ **Done, verified** |
 | **3** | Identity + Catalog: EF Core models, migrations, REST APIs, event handlers, inbox + outbox, cache-aside | ✅ **Done, verified** |
 | **4** | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ✅ **Done, verified** |
-| 5 | Engagement + Search: sharded counters, reactions, comments, inverted index | ⬜ Next |
-| 6 | Gateway BFF aggregation + Next.js frontend with hls.js adaptive player | ⬜ |
+| **5** | Engagement + Search: sharded counters, idempotent reactions, comments, DynamoDB inverted index, Postgres trigram FTS comparison | ✅ **Done, verified** |
+| 6 | Gateway BFF aggregation + Next.js frontend with hls.js adaptive player | ⬜ Next |
 | 7 | `DESIGN.md` — doc-to-code mapping and interview question bank | ⬜ |
 
 Stretch goals once the pipeline is end to end: per-shot encoding (chapter 5),

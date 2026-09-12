@@ -114,7 +114,7 @@ the `eventType` message attribute, so a consumer is not even woken for events it
 does not handle. Adding a consumer is a new subscription — no producer change,
 no redeploy upstream.
 
-### The five events
+### The four events
 
 | Event | Published by | Consumed by |
 |---|---|---|
@@ -122,6 +122,10 @@ no redeploy upstream.
 | `VideoEncoded` | Encoder ✅ | Catalog, Search, Engagement |
 | `VideoEncodingFailed` | Encoder ✅ | Catalog |
 | `VideoDeleted` | **Catalog ✅** | Search, Engagement |
+
+`VideoEncoded` grew three fields in phase 5 — `Title`, `Description`, `Tags`,
+copied from the `VideoUploaded` that started the encode — purely so Search
+can index a video from this one event alone. See §3.7.
 
 ### Storage, and why each store exists
 
@@ -378,6 +382,116 @@ other cannot.
 
 ---
 
+### 3.7 Engagement, comments, and search (phase 5)
+
+---
+
+**Sharded view counters over one row per video**
+
+- *Alternative:* a single DynamoDB item holding the view count.
+- *Why:* one item caps out around 1,000 writes/sec, and a viral video's view
+  counter is the single hottest key in the system. Splitting it into
+  `ViewShardCount` (10) items keyed `VIEWS#0..9` and picking one at random per
+  write scatters the load; reads sum whatever shards actually exist rather
+  than assuming all ten are populated. Likes/dislikes stay unsharded — the
+  uniqueness check they require already caps their write rate well below an
+  anonymous view ping's.
+- *Where:* `VideoCounterRepository`, `EngagementOptions.ViewShardCount`.
+
+---
+
+**Atomic `ReturnValues=ALL_OLD` instead of read-then-decide for reactions**
+
+- *Alternative:* look up the caller's current reaction, decide the counter
+  delta in application code, then write the new reaction.
+- *Why:* that read and that write are two separate round trips. Two
+  concurrent clicks from the same user can both read "no reaction" and both
+  increment the counter — a real double-count, not a theoretical one.
+  `PutItem`/`DeleteItem` with `ReturnValues=ALL_OLD` makes "write the new
+  reaction" and "report what it replaced" one atomic server-side step, so the
+  delta computed from the response is always correct even under concurrency.
+  Verified: ten concurrent identical like requests from one user landed at
+  exactly one like.
+- *Where:* `UserReactionRepository.PutAsync`/`RemoveAsync`, `ReactionService`.
+
+---
+
+**Tombstone, not cascade, for a comment with replies**
+
+- *Alternative:* cascade-delete replies along with their parent.
+- *Why:* a top-level comment's replies belong to other people; deleting them
+  because the parent was deleted destroys content the deleter doesn't own.
+  The self-referencing `parent_comment_id` foreign key is `Restrict`, which
+  makes that failure mode impossible at the schema level rather than a
+  behaviour someone has to remember to avoid in the service. Deletion
+  branches on whether replies exist: none → physical delete; any → blank the
+  text and set `IsDeleted`, keeping the row so the thread stays intact. A
+  reply can never have replies of its own (one-level nesting, enforced in
+  `CommentService.AddAsync`), so its delete always takes the physical path.
+- *Where:* `Comment.IsDeleted`, `CommentService.DeleteAsync`.
+
+---
+
+**Conditional writes close the cross-store idempotency gap an inbox can't reach**
+
+- *Alternative:* accept that DynamoDB writes triggered by an inbox-protected
+  Postgres transaction can still be applied twice on redelivery.
+- *Why:* the inbox claim and the DynamoDB write cannot commit as one
+  transaction — there is nothing to enrol the second write in. Claiming the
+  event first narrows the redelivery window; it doesn't close it. What closes
+  it is making the write itself idempotent: `VideoCounterRepository`'s
+  counter-initialisation `PutItem` is conditioned on
+  `attribute_not_exists(videoId)`, so a redelivered `VideoEncoded` cannot
+  reset a counter real traffic has already moved. Verified: bumped likes to 5
+  out-of-band, replayed the event with a fresh id, likes stayed at 5.
+- *Where:* `VideoCounterRepository.InitializeAsync` (Engagement).
+
+---
+
+**Denormalise metadata into `VideoEncoded` rather than call Catalog back**
+
+- *Alternative:* Search's `VideoEncodedHandler` calls Catalog's read API to
+  fetch title/description/tags at index time.
+- *Why:* that makes an async, otherwise fully event-driven queue consumer's
+  success depend on a second service being reachable, purely to process one
+  message — coupling two services' availability for no structural reason.
+  `VideoEncoded` instead carries `Title`/`Description`/`Tags`, copied from the
+  `VideoUploaded` Encoder already has in hand when it publishes — the same
+  reasoning `VideoUploaded` itself already uses to avoid a callback.
+- *Where:* `JameX.Contracts.Events.VideoEncoded`, `Encoder/VideoUploadedHandler.PublishEncodedAsync`.
+
+---
+
+**The one synchronous service-to-service HTTP call in this codebase**
+
+- *Alternative:* keep the "never call another service synchronously" rule
+  absolute, and have Search return bare video ids with no title or thumbnail.
+- *Why:* a search *request* is not a queue consumer — the caller is already
+  synchronously blocked on this HTTP response, so one more HTTP hop to
+  Catalog's batch endpoint costs nothing structurally that wasn't already
+  being paid. The rule the previous entry protects is specifically about
+  async handlers gaining a live dependency; a request path gaining one is a
+  different, acceptable trade. A Catalog outage degrades this to "no
+  results," not a 500.
+- *Where:* `ICatalogClient`, `SearchQueryService` (Search).
+
+---
+
+**`word_similarity`, not plain `similarity`, for trigram title search**
+
+- *Alternative:* `pg_trgm`'s `%` operator / `similarity()` function.
+- *Why:* `similarity()` compares two entire strings, so a short query like
+  "guitar" against a long title is penalised by the size mismatch between
+  their trigram sets alone — independent of whether the word is actually
+  present. Verified directly: a real title match failed under `similarity()`
+  and succeeded under `word_similarity()`, which instead asks whether *some
+  substring* of the title matches the query — the question a search box
+  actually needs answered. Same GIN index either way; only the comparison
+  function changed.
+- *Where:* `VideoRepository.SearchByTitleAsync` (Catalog).
+
+---
+
 ## 4. Failure modes and what defends against them
 
 The most useful way to hold the design in your head.
@@ -398,7 +512,7 @@ The most useful way to hold the design in your head.
 | 12 | A client requests a million rows | Page size clamped, batch size capped | ✅ |
 | 13 | A viral video's first seconds DDoS the origin | `proxy_cache_lock` — one request fills, the rest wait | ✅ (infra) |
 | 14 | A 600 MB upload blocks a request thread | Presigned direct-to-S3 multipart | ✅ |
-| 15 | A view counter becomes a hot partition | Sharded counters, scatter writes / gather reads | ⬜ phase 5 |
+| 15 | A view counter becomes a hot partition | Sharded counters, scatter writes / gather reads | ✅ |
 | 17 | Two parts of the same upload land at once | `UpdateExpression` on one map key, not read-modify-write | ✅ |
 | 18 | Completion is retried (client timeout, double-click) | Event id stored with the state transition; retry reuses it | ✅ |
 | 19 | A rendition would be taller than the source | Ladder generation skips it; falls back to source's own height | ✅ |
@@ -406,6 +520,12 @@ The most useful way to hold the design in your head.
 | 21 | A permanent encode failure retries forever | `EncodingFailedException` caught, published, not retried | ✅ |
 | 22 | A transient fault (S3 down) is mistaken for a bad file | Left uncaught — propagates to the queue's own retry | ✅ |
 | 16 | The metadata database outgrows one machine | Read replicas, then sharding by `channelId` (Vitess) | ⬜ designed only |
+| 23 | Two concurrent identical reactions from one user double-count | `ReturnValues=ALL_OLD` makes the write atomically report what it replaced | ✅ |
+| 24 | A redelivered `VideoEncoded` resets a counter real traffic already moved | `PutItem` conditioned on `attribute_not_exists(videoId)` | ✅ |
+| 25 | Deleting a comment with replies orphans them or violates the FK | Tombstone (blank text, keep row) instead of cascade; FK is `Restrict` | ✅ |
+| 26 | An inverted-index consumer needs data an event doesn't carry | Denormalise the field into the event, not a synchronous callback | ✅ |
+| 27 | The inverted index's base table can't be queried by video id | A `by-video` GSI, same pattern as Engagement's reaction teardown | ✅ |
+| 28 | A short query scores too low against a long title in trigram search | `word_similarity()`, not plain `similarity()`, over the same GIN index | ✅ |
 
 ---
 
@@ -540,7 +660,7 @@ By write rate on the hot key. `subscriber_count` is denormalised because
 subscriptions are low-volume. View counts are not, because one row cannot absorb
 a viral video's write rate — those become sharded counters.
 
-**"How do you handle the write volume on view counts?"** ⬜ phase 5
+**"How do you handle the write volume on view counts?"**
 Sharded counters in DynamoDB. One item per video is a hot partition capped near
 1,000 writes/sec; writes scatter across N shard keys and reads gather and sum.
 You trade instantaneous exactness for linear write scaling — acceptable, because
@@ -614,6 +734,69 @@ left to propagate and let the queue's own retry-with-backoff handle them.
 Catching everything into one failure path loses this distinction and either
 wastes retries on the unfixable or gives up too early on the recoverable.
 
+### Search and engagement (phase 5)
+
+**"A user double-clicks Like. How do you stop the counter incrementing
+twice?"**
+Don't decide the counter delta from a read; decide it from what the write
+itself reports. `PutItem`/`DeleteItem` with `ReturnValues=ALL_OLD` makes
+"write the new reaction" and "tell me what it replaced" one atomic step, so
+concurrent writes from the same user can't both see "no reaction" and both
+increment. Verified with ten concurrent identical requests landing at
+exactly one.
+
+**"You have an event consumer with no relational database. How do you make
+it safe against redelivery?"**
+Two layers, and naming both matters. A Redis-based check narrows the window
+the same way it does for a transcoding consumer, but it cannot close it —
+Redis is a separate system from wherever the actual effect lands. What
+closes it is making the effect itself idempotent: a DynamoDB write
+conditioned on the row not already existing turns a redelivered
+initialisation into a genuine no-op, instead of resetting real activity.
+
+**"A comment has replies. The author deletes it. What happens to the
+thread?"**
+It's tombstoned, not cascaded: the text is cleared and a flag is set, but the
+row survives so replies don't point at nothing. Cascading would silently
+delete other people's comments to satisfy one person's action. The
+self-referencing foreign key is `Restrict`, which makes "just delete it" fail
+at the database rather than relying on every future code path to remember
+the rule.
+
+**"Explain an inverted index the way you'd whiteboard it."**
+Flip the key: instead of `document → words it contains`, store `word →
+documents containing it`. `term` is the partition key, `videoId` the sort
+key; each row also carries how often the term occurred and where. Searching
+one word is one partition read. Searching several has no single query — you
+read each term's partition independently and keep only the documents that
+appeared under *every* one, ranked by summed frequency. Deleting a document
+needs its own secondary index keyed by document id, because the base table
+can't answer "which rows mention this document" on its own.
+
+**"When would an event carry data that seems out of place for it, like a
+video's title inside an 'encoding finished' event?"**
+When the alternative is a queue consumer calling another service
+synchronously just to fetch it — which makes an otherwise fully
+event-driven, independently-failing consumer's success depend on that other
+service being up, for one message. Denormalising the field into the event
+costs a few extra bytes and keeps the consumer able to act alone. This
+system draws the line precisely there: the same codebase makes exactly one
+synchronous cross-service call, and only from a request path where a human
+is already synchronously waiting on the response, never from a background
+handler.
+
+**"Inverted index or relational full-text search — how do you choose?"**
+By who owns the data and what the write volume looks like. If you already
+own the source data in a database, FTS there is nearly free and never lags
+behind a write. Reach for a dedicated index when a different service needs
+to serve the queries, or when indexing write volume would overwhelm the
+database that owns the source data. The two also fail differently: an
+exact-token index has no typo tolerance at all; a trigram/FTS index has
+no clean multi-term boolean logic. A misspelled single-word query is the
+sharpest way to show the gap live — it succeeds under trigram similarity and
+fails outright under exact-token matching, with the same underlying data on
+both sides.
+
 ### Implementation-level
 
 **"Do you use the repository pattern with EF Core?"**
@@ -648,11 +831,13 @@ repository and domain layers did not change by a line — which is the real poin
 | Queue mechanics: DLQ, visibility, retry budgets | Good | ✅ |
 | Pub/sub fan-out with filtering | Good | ✅ |
 | Back-of-envelope estimation | Good | — analysis only |
-| Sharded counters, hot partitions | Designed | ⬜ phase 5 |
+| Sharded counters, hot partitions | **Strong** | ✅ verified: 10-way shard, 10 concurrent writes, correct sum |
 | Large-file upload, resumability | **Strong** | ✅ verified: concurrent parts, resume, idempotent completion |
 | Transcoding, ABR ladder | **Strong** | ✅ verified: GOP alignment, no-upscale, real FFmpeg |
 | Data-plane / control-plane separation | **Strong** | ✅ bytes bypass the service; only metadata does not |
-| Inverted index vs relational FTS | Designed | ⬜ phase 5 |
+| Inverted index vs relational FTS | **Strong** | ✅ verified: both live, typo tolerance demonstrated live on one, not the other |
+| Idempotent writes with no relational store (Dynamo-only services) | **Strong** | ✅ conditional writes + `ReturnValues=ALL_OLD`, both verified under concurrency |
+| Soft-delete / tombstoning to preserve referential structure | Good | ✅ comments |
 | CDN tiering by popularity | Designed | ⬜ phase 5–6 |
 | Database sharding, Vitess | Reading only | ⬜ not planned |
 | Auth, rate limiting, recommendations | Out of scope | ⬜ |
