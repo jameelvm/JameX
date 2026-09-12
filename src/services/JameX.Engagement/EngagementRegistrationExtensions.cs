@@ -2,6 +2,7 @@ using JameX.Engagement.Configuration;
 using JameX.Engagement.Data;
 using JameX.Engagement.EventHandlers;
 using JameX.Engagement.Repositories;
+using JameX.Engagement.Services;
 using JameX.ServiceDefaults.Data;
 using JameX.ServiceDefaults.Hosting;
 
@@ -16,6 +17,10 @@ public static class EngagementRegistrationExtensions
 
         services.AddScoped<IVideoCounterRepository, VideoCounterRepository>();
         services.AddScoped<IUserReactionRepository, UserReactionRepository>();
+
+        services.AddScoped<IReactionService, ReactionService>();
+        services.AddScoped<IViewService, ViewService>();
+        services.AddScoped<IEngagementQueryService, EngagementQueryService>();
 
         // Bound to EngagementDbContext, so the inbox claim commits in the same
         // transaction as anything else staged on that context — comments,

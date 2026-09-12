@@ -20,11 +20,27 @@ public interface IUserReactionRepository
     /// <summary>Null means no reaction — absence of a row <i>is</i> "none", never a stored value.</summary>
     Task<ReactionKind?> GetAsync(Guid userId, Guid videoId, CancellationToken ct);
 
-    /// <summary>Upserts the caller's reaction. A second call with the same kind is a harmless no-op.</summary>
-    Task PutAsync(Guid userId, Guid videoId, ReactionKind kind, CancellationToken ct);
+    /// <summary>
+    /// Upserts the caller's reaction and atomically returns whichever reaction
+    /// it replaced (null if there was none).
+    /// <para>
+    /// The return value is what lets <c>ReactionService</c> know which counter
+    /// to adjust without a separate read first. A plain "read, then write" would
+    /// race: two concurrent likes from the same user could both read "no
+    /// reaction" and both increment the likes counter, double-counting one
+    /// person's click. <c>PutItem</c> with <c>ReturnValues=ALL_OLD</c> reads and
+    /// writes as one atomic step at the server, so whichever request wins the
+    /// race is guaranteed to see the other's effect.
+    /// </para>
+    /// </summary>
+    Task<ReactionKind?> PutAsync(Guid userId, Guid videoId, ReactionKind kind, CancellationToken ct);
 
-    /// <summary>Withdraws a reaction — the row is deleted, not set to some "none" value, for the same reason <see cref="ReactionKind"/> has no None member.</summary>
-    Task RemoveAsync(Guid userId, Guid videoId, CancellationToken ct);
+    /// <summary>
+    /// Withdraws a reaction and atomically returns whatever was withdrawn (null
+    /// if there was nothing to remove) — same <c>ReturnValues=ALL_OLD</c>
+    /// reasoning as <see cref="PutAsync"/>.
+    /// </summary>
+    Task<ReactionKind?> RemoveAsync(Guid userId, Guid videoId, CancellationToken ct);
 
     /// <summary>
     /// Every reaction recorded against a video, for the <c>VideoDeleted</c>
@@ -55,8 +71,9 @@ internal sealed class UserReactionRepository(
             : null;
     }
 
-    public Task PutAsync(Guid userId, Guid videoId, ReactionKind kind, CancellationToken ct) =>
-        dynamo.PutItemAsync(new PutItemRequest
+    public async Task<ReactionKind?> PutAsync(Guid userId, Guid videoId, ReactionKind kind, CancellationToken ct)
+    {
+        var response = await dynamo.PutItemAsync(new PutItemRequest
         {
             TableName = _table,
             Item = new Dictionary<string, AttributeValue>
@@ -65,15 +82,29 @@ internal sealed class UserReactionRepository(
                 ["videoId"] = new(videoId.ToString()),
                 ["reactionKind"] = new() { N = ((int)kind).ToString() },
                 ["reactedAt"] = new(DateTimeOffset.UtcNow.ToString("O"))
-            }
+            },
+            ReturnValues = ReturnValue.ALL_OLD
         }, ct);
 
-    public Task RemoveAsync(Guid userId, Guid videoId, CancellationToken ct) =>
-        dynamo.DeleteItemAsync(new DeleteItemRequest
+        return ParseReactionKind(response.Attributes);
+    }
+
+    public async Task<ReactionKind?> RemoveAsync(Guid userId, Guid videoId, CancellationToken ct)
+    {
+        var response = await dynamo.DeleteItemAsync(new DeleteItemRequest
         {
             TableName = _table,
-            Key = Key(userId, videoId)
+            Key = Key(userId, videoId),
+            ReturnValues = ReturnValue.ALL_OLD
         }, ct);
+
+        return ParseReactionKind(response.Attributes);
+    }
+
+    private static ReactionKind? ParseReactionKind(Dictionary<string, AttributeValue>? attributes) =>
+        attributes is { Count: > 0 }
+            ? (ReactionKind)int.Parse(attributes["reactionKind"].N)
+            : null;
 
     public async Task DeleteAllForVideoAsync(Guid videoId, CancellationToken ct)
     {

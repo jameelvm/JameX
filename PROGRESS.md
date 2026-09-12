@@ -39,11 +39,11 @@ and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-10
+**Last updated:** 2026-09-11
 **Phases 1–4: COMPLETE, verified, documented in README.md and DESIGN.md.**
-**Phase 5 in progress: Module 1 (Engagement data model + counter/reaction
-lifecycle) done and verified. Next: Module 2 (Reaction/View services + REST
-API).**
+**Phase 5 in progress: Modules 1–2 done and verified (Engagement data model,
+counter/reaction lifecycle, and the Reaction/View/Counts REST API). Next:
+Module 3 — comments.**
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
@@ -245,12 +245,46 @@ Rationale kept in `README.md` §"Why seven services".
       removed both counter rows and a planted reaction row (confirmed via the
       `by-video` GSI returning zero items).
 
+- [x] **Module 2 — Reaction/View services and the Engagement REST API.**
+      `IReactionService` (like/dislike/switch/withdraw), `IViewService`
+      (record-a-view), `IEngagementQueryService` (read counts) sit between
+      `EngagementController` and the two repositories from Module 1.
+      Routes: `GET/PUT/DELETE /videos/{id}/reactions/me`, `POST
+      /videos/{id}/views`, `GET /videos/{id}/counts` — matching the Gateway's
+      YARP routes already present in `JameX.Gateway/appsettings.json` from an
+      earlier session (`video-reactions`, `video-engagement`).
+
+      **The real problem this module solved:** `UserReactionRepository`
+      previously did a plain `PutItem`/`DeleteItem`, which would have forced
+      `ReactionService` into read-then-decide-then-write — and that read and
+      that write are two separate round trips, so two concurrent clicks from
+      the same user could both read "no reaction" and both increment the
+      likes counter, double-counting one person. Fixed by having
+      `PutAsync`/`RemoveAsync` use DynamoDB's `ReturnValues=ALL_OLD`, which
+      makes "write the new reaction" and "learn what it replaced" one atomic
+      server-side step — whichever concurrent request is serialised second is
+      guaranteed to see the first one's effect, so the counter adjustment it
+      computes is always correct.
+
+      **Verified against the live stack**, both directly against Engagement
+      (`:8084`) and through the Gateway (`:8080/api/...`): counts read
+      0/0/0/0 before any activity; a view ping incremented views to 1;
+      reacting Like moved likes to 1; reacting Like again was a true no-op
+      (counts unchanged); switching Like→Dislike moved likes back to 0 and
+      dislikes to 1 in the same call; removing a reaction and removing it
+      again both returned success with counts unaffected the second time; an
+      undefined `kind` value returned 400 with a validation body. **The
+      concurrency fix specifically**: fired 10 simultaneous identical
+      PUT-Like requests from one user — likes stayed at exactly 1, not 10.
+
 ### Next up (immediate)
 
-Module 2 — the `IReactionService`/`IViewService` application layer and the
-Engagement REST API (like/dislike/unlike, record-a-view, read counters).
-Comments (Module 3+) and the DynamoDB inverted-index vs. Postgres FTS
-comparison for Search come after.
+Module 3 — comments: nesting-depth validation in the service layer (the
+one-level-deep rule `Comment.cs` already documents), the comment REST API
+under `/videos/{id}/comments` (already routed at the Gateway), and wiring
+`EngagementQueryService`'s `Comments` field to a real count instead of the
+hardcoded 0. The DynamoDB inverted-index vs. Postgres FTS comparison for
+Search comes after that.
 
 ---
 
