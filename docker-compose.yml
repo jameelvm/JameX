@@ -193,6 +193,13 @@ services:
       ReverseProxy__Clusters__engagement__Destinations__local__Address:     "http://jamex-host:5084/"
       ReverseProxy__Clusters__search__Destinations__container__Address:     "http://search:8080/"
       ReverseProxy__Clusters__search__Destinations__local__Address:         "http://jamex-host:5085/"
+      # The BFF's own outgoing calls — always the container address. Unlike
+      # the reverse proxy clusters above, these have no local-debugging
+      # fallback; the watch page always talks to whatever is actually running
+      # in compose.
+      BffClients__CatalogBaseUrl:    "http://catalog:8080"
+      BffClients__EngagementBaseUrl: "http://engagement:8080"
+      BffClients__IdentityBaseUrl:   "http://identity:8080"
     depends_on:
       <<: *service-deps
 

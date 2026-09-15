@@ -39,9 +39,10 @@ and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-12
+**Last updated:** 2026-09-15
 **Phases 1–5: COMPLETE, verified, documented in README.md and DESIGN.md.**
-**Next: Phase 6 — Gateway BFF aggregation + Next.js frontend.**
+**Phase 6 in progress: Gateway BFF aggregation (the watch page) built and
+verified end to end. Next: the Next.js frontend.**
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
@@ -443,15 +444,57 @@ Rationale kept in `README.md` §"Why seven services".
       and engagement" question-bank section, and an updated coverage map
       (three rows moved from Designed/⬜ to Strong/✅).
 
+**Phase 6 — Gateway and frontend.**
+
+- [x] **Gateway BFF aggregation — the watch page in one round trip.**
+      `WatchController` (`GET /api/watch/{videoId}`) is the one endpoint the
+      Gateway serves itself rather than proxying — every other `/api/...`
+      route is YARP forwarding. `IWatchAggregationService` calls Catalog
+      first and alone (no video, nothing to aggregate onto), then fans
+      Engagement (counts + the caller's own reaction) and Identity (channel
+      name) out **concurrently** via `Task.WhenAll`, and merges the results
+      onto Catalog's `VideoDetail` with a `with` expression — the same
+      record `VideoDetail.ChannelName`/`Counts`/`ViewerReaction` fields that
+      have sat null/zeroed since phase 3 specifically for this moment.
+
+      Three small typed `HttpClient`s (`ICatalogReadClient`,
+      `IEngagementReadClient`, `IIdentityReadClient`), matching Search's
+      `ICatalogClient` pattern. Deliberately asymmetric failure handling:
+      Catalog's client lets a fault propagate (no video is not a state the
+      page can degrade around), Engagement's and Identity's clients catch
+      `HttpRequestException` and return null (a watch page with stale/zeroed
+      counts or a missing channel name is a visible degradation, not a
+      broken page).
+
+      **Forwarding the caller's identity required a small shared-plumbing
+      fix.** The Gateway needs to set the `X-JameX-User` header on its own
+      *outgoing* call to Engagement (to resolve the viewer's own reaction),
+      but the header-name constant lived on `internal sealed class
+      HeaderCurrentUser` in `ServiceDefaults` — inaccessible outside that
+      assembly. Made the class `public` (the constant was already public;
+      only the containing class blocked reuse) rather than duplicating the
+      literal `"X-JameX-User"` string in Gateway's client code.
+
+      **Verified against the live stack**: real user/channel created in
+      Identity, real video pushed through `VideoUploaded`→`VideoEncoded` to
+      both Catalog and Engagement; `GET /api/watch/{id}` anonymously
+      returned the channel name, zeroed counts, and `viewerReaction: null`
+      in one call; after recording a real view and a real like directly
+      against Engagement, the **same** endpoint reflected `views: 1, likes:
+      1` and, called **with** the liker's own `X-JameX-User` header,
+      returned `viewerReaction: 0` — while an anonymous call for the same
+      video still correctly showed `viewerReaction: null` alongside the
+      same updated counts. A nonexistent video id returned 404.
+
 ### Next up (immediate)
 
-**Phase 5 is closed.** Start Phase 6 — Gateway BFF aggregation (the watch
-page composed from Catalog + Engagement + Identity in one call) and the
-Next.js frontend with hls.js. Comments still leaves one open thread worth
-returning to there or later: a real system would let a channel owner
-moderate comments on their own videos, which Engagement cannot authorise
-today for the same cross-service-ownership reason Catalog cannot verify
-channel ownership (see Open questions below).
+The Next.js frontend: watch page with hls.js (consuming `GET
+/api/watch/{id}` and showing live rendition switching), and a resumable
+upload UI porting the logic already proven in `web/debug/index.html` into a
+real app. Comments still leaves one open thread worth returning to: a real
+system would let a channel owner moderate comments on their own videos,
+which Engagement cannot authorise today for the same cross-service-ownership
+reason Catalog cannot verify channel ownership (see Open questions below).
 
 ---
 
@@ -466,7 +509,8 @@ Ordered. Each phase leaves the build green **and** updates `README.md`.
 5. ~~Engagement and Search~~ — done. Sharded view counters, idempotent
    reactions, comments; DynamoDB inverted index plus a Postgres trigram FTS
    comparison. `README.md` §10 and `DESIGN.md` §3.7 written and current.
-6. **Gateway and frontend** — BFF aggregation for the watch page; Next.js with
+6. **Gateway and frontend** — in progress. BFF aggregation for the watch page
+   (`GET /api/watch/{id}`) done and verified. Still needed: Next.js with
    hls.js showing live rendition switching, resumable upload UI.
 7. **DESIGN.md** — deeper doc-to-code mapping, once phase 6 gives the Gateway
    something real to map. The decision register, failure-mode table and

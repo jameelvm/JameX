@@ -213,7 +213,13 @@ internal sealed class UnauthorizedExceptionHandler : IExceptionHandler
     }
 }
 
-internal sealed class HeaderCurrentUser(IHttpContextAccessor accessor) : ICurrentUser
+/// <summary>
+/// Public (not internal) specifically so <see cref="HeaderName"/> is usable
+/// outside this assembly — the Gateway's BFF clients need to forward the
+/// caller's identity to Engagement on outgoing calls it originates itself,
+/// not just read it off its own incoming request.
+/// </summary>
+public sealed class HeaderCurrentUser(IHttpContextAccessor accessor) : ICurrentUser
 {
     public const string HeaderName = "X-JameX-User";
 

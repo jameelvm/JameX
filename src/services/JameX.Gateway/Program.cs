@@ -1,3 +1,4 @@
+using JameX.Gateway;
 using JameX.ServiceDefaults.Hosting;
 
 // The Gateway is the only address the browser knows. It exists for three
@@ -20,6 +21,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddJameXServiceDefaults(ServiceName);
 builder.AddJameXApiDefaults();
+builder.Services.AddGatewayServices(builder.Configuration);
 
 builder.Services
     .AddReverseProxy()
@@ -27,6 +29,7 @@ builder.Services
 
 var app = builder.Build();
 
+app.UseJameXExceptionHandling();
 app.UseCors();
 app.MapJameXDefaultEndpoints(ServiceName);
 
