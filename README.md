@@ -1,7 +1,7 @@
 # JameX
 
-A working YouTube clone, built to learn the system design behind it well enough
-to defend it in an interview.
+A working YouTube clone, built to learn and be able to explain and defend
+every design decision behind a system at this scale.
 
 The specification is the five-chapter design document in the parent folder
 (`1.System Design_ YouTube.pdf` … `5.The Reality Is More Complicated.pdf`). Every
@@ -10,9 +10,11 @@ component that document describes has a real, runnable counterpart here.
 **Stack:** .NET 10 · PostgreSQL · DynamoDB · S3 · SQS · SNS · Redis · FFmpeg ·
 YARP · Next.js · Docker Compose + LocalStack
 
-**Build status:** phases 1–4 complete and verified. The whole pipeline runs
-end to end: presigned resumable upload → FFmpeg ABR ladder → Catalog → CDN
-playback. A real video goes from upload to playable HLS in under 20 seconds.
+**Build status:** phases 1–6 complete and verified. The whole pipeline runs
+end to end, in a real browser: presigned resumable upload → FFmpeg ABR
+ladder → Catalog → CDN → hls.js playback, with live reactions, comments, a
+real home feed, and search. A real video goes from upload to playable HLS in
+under 20 seconds.
 
 ---
 
@@ -28,9 +30,10 @@ playback. A real video goes from upload to playable HLS in under 20 seconds.
 8. [Phase 3 — Identity and Catalog](#8-phase-3--identity-and-catalog)
 9. [Phase 4 — Ingest and Encoder](#9-phase-4--ingest-and-encoder)
 10. [Phase 5 — Engagement and Search](#10-phase-5--engagement-and-search)
-11. [Verification](#11-verification)
-12. [Interview talking points](#12-interview-talking-points)
-13. [Roadmap](#13-roadmap)
+11. [Phase 6 — Gateway and frontend](#11-phase-6--gateway-and-frontend)
+12. [Verification](#12-verification)
+13. [Design talking points](#13-design-talking-points)
+14. [Roadmap](#14-roadmap)
 
 ---
 
@@ -59,7 +62,7 @@ Six, from chapter 2. Deliberately small — the difficulty is scale, not feature
 ### The numbers that drive every decision
 
 These are the back-of-the-envelope figures from chapter 2. Learn to *derive*
-them; interviewers ask you to reason, not recall.
+them — the point is to reason your way there, not recall a number.
 
 **Assumptions**
 
@@ -108,10 +111,10 @@ Servers = requests_per_second / server_RPS
         = 500,000,000 / 64,000  =  7,812.5  ≈  8K servers
 ```
 
-Treat this one with suspicion in an interview, and say so. Using DAU directly as
+Treat this one with suspicion, and say so. Using DAU directly as
 requests-per-second is a wild over-estimate. The honest framing is that
-*concurrency*, not daily totals, sizes a fleet. Volunteering that critique scores
-better than reciting the arithmetic.
+*concurrency*, not daily totals, sizes a fleet. Naming that critique yourself
+is worth more than reciting the arithmetic.
 
 ### The one consistency decision
 
@@ -218,7 +221,7 @@ through the Gateway; everything else propagates as events.
 | CDN / colocation / ISP PoP | Google CDN + IXP | nginx `proxy_cache` | `edge` |
 | Encoder job fan-out | (implicit) | SNS → SQS with DLQs | LocalStack |
 
-Two rows are not one-to-one, and an interviewer will probe both:
+Two rows are not one-to-one, and a careful review will probe both:
 
 - **Bigtable → DynamoDB.** Both are partitioned, key-ordered, high-throughput
   key-value stores with no joins. Bigtable's row key ↔ DynamoDB's partition +
@@ -289,7 +292,7 @@ Being able to state the cost matters as much as the benefit:
 ```
 App/
 ├── README.md            ← this file: end-to-end documentation
-├── DESIGN.md            ← system design summary + interview question bank
+├── DESIGN.md            ← system design summary + design Q&A
 ├── TABLES-WALKTHROUGH.md ← plain-language tour of the Catalog tables
 ├── CLAUDE.md            ← project context and conventions
 ├── PROGRESS.md          ← live build state; what is next
@@ -1808,7 +1811,229 @@ unindexed word.
 
 ---
 
-## 11. Verification
+## 11. Phase 6 — Gateway and frontend
+
+Every earlier phase proved a backend concept against `curl` and DynamoDB
+scans. Phase 6 is the one that has to survive an actual browser: a real
+person clicking, a real `<video>` element, a real cross-origin request — and
+it surfaced bugs none of the earlier, service-level verification ever could,
+because none of it involved a browser enforcing anything.
+
+### 11.1 What exists now
+
+| | Gateway (BFF addition) | `web/` (Next.js) |
+|---|---|---|
+| Owns | — (aggregates, doesn't store) | — (a client, not a service) |
+| New surface | `GET /api/watch/{videoId}` — the one endpoint it serves itself | App Router pages: `/`, `/search`, `/watch/[videoId]`, `/upload` |
+| Calls | Catalog, Engagement, Identity (fanned out, not sequential) | Catalog, Engagement, Identity, Search, Ingest — all through the Gateway |
+| Scales on | request fan-out cost, same as Catalog/Engagement/Identity combined | static hosting / CDN, not a backend concern at all |
+
+### 11.2 The Gateway as its own BFF — one endpoint it serves, everything else it forwards
+
+Every other `/api/...` route is a pure YARP reverse-proxy rule — path in,
+path out, no logic. `WatchController` is the deliberate exception: the watch
+page needs a video's Catalog record, its Engagement counts and the caller's
+own reaction, and its channel's name from Identity, and showing it means one
+round trip from the browser, not four. `IWatchAggregationService` calls
+Catalog first and alone — there is nothing to aggregate onto without a video
+— then fans Engagement and Identity out **concurrently** with
+`Task.WhenAll`, merging both onto Catalog's record with a `with` expression.
+
+The failure handling is deliberately asymmetric. Catalog's client lets a
+fault propagate — "no video" isn't a state the page can degrade around.
+Engagement's and Identity's clients catch `HttpRequestException` and return
+null instead: a watch page with stale counts or a missing channel name is a
+visible degradation, not a broken page. This is the same choice chapter 2
+makes about aggregation layers generally — a BFF should make its callers'
+outages cheaper to tolerate, not just cheaper to detect.
+
+### 11.3 Viewer identity — a guest stub, and the cookie gap that broke "your own reaction"
+
+Auth was never in scope (see the design doc's stated boundaries), but every
+interactive feature in this phase — reacting, commenting, uploading — needs
+*a* caller identity to authorise against. `ViewerProvider` provisions one
+real Identity user on first visit (`POST /users`), persists
+`{userId, displayName}` in `localStorage`, and reuses it on every later
+visit. It is not a security mechanism; it is the minimum viable stand-in for
+the header the doc's own Gateway-authenticates-once design would forward in
+production.
+
+**A real gap, caught by reloading the page, not assumed away.** After
+liking a video, reloading it showed the correct count but never the active
+highlight — the like had genuinely happened. The watch page's data comes
+from a Server Component `fetch`, which runs on the Node process with no
+access to the browser's `localStorage`; every server-rendered load was
+therefore anonymous no matter what the browser's guest had actually done.
+The fix mirrors just the viewer id into a cookie (`lib/viewer/cookie.ts`
+writes it from the browser, `lib/viewer/server-viewer.ts` reads it via
+`next/headers` on the server — two files, not one, because mixing
+browser-only `document.cookie` and server-only `cookies()` in the same
+module breaks bundling in whichever direction you didn't test) and forwards
+it as `X-JameX-User` on the server-side call to `GET /api/watch/{id}` — the
+exact header `WatchAggregationService` already knew how to use. No backend
+change; the frontend was missing a way to say who was asking.
+
+### 11.4 Reactions and comments — optimistic UI over the same backend guarantees phase 5 proved
+
+`ReactionButtons` seeds from the server-rendered `VideoDetail`, then owns its
+own state: a click updates the UI immediately and calls the API in the
+background, rolling back to the pre-click snapshot on failure. This is
+purely a UX choice sitting on top of an already-idempotent backend — §10.4's
+`ReturnValues=ALL_OLD` swap is what makes it safe to fire the request without
+waiting, not something this phase had to re-solve. A small pure helper,
+`applyReactionChange`, computes the counts delta for every case (fresh,
+switch, remove) so the component itself never open-codes the arithmetic.
+
+Comments surfaced one more real gap from actually clicking through the flow,
+not from reading the API contract. §10.5's tombstone convention has no
+`isDeleted` field on the wire — the marker *is* the literal string
+`"[deleted]"` in `comment.text`. The first version tracked "did I just
+delete this" as purely local client state, so a page reloaded after a
+tombstone (deleted in an earlier session, or by someone else) still showed
+live Edit/Delete controls on it. The fix, `isCommentDeleted()`
+(`lib/comments.ts`), checks the text itself as a fallback everywhere a
+comment renders — the same lesson §10.5 already teaches about the backend
+applied one layer up, in the UI that has to render that backend's contract
+honestly.
+
+### 11.5 hls.js adaptive playback — two false trails and one real bug
+
+This took the longest of anything in this phase, and the false trails are as
+instructive as the real fix.
+
+**False trail 1 — the tab was never actually playing.** Automated browser
+tabs run backgrounded by design (an automation tool that stole the user's
+foreground focus would be a much worse tool). hls.js's `StreamController`
+exits its own tick loop immediately whenever the document isn't visible —
+confirmed directly by reading `hls.streamController.state` (`"IDLE"`) and
+`document.visibilityState` (`"hidden"`) on a live instance — so the manifest
+and every rendition playlist loaded correctly, the quality selector showed
+real parsed levels, and `video.readyState` still sat at 0 forever. Every
+earlier "curl and fetch succeed, only hls.js's own loader fails" finding in
+this project's history was this, not a network problem: none of curl,
+fetch, or XHR go through a stream controller's tick loop, so none of them
+were ever affected by the tab being backgrounded.
+
+**False trail 2 — a real hls.js resilience gap, worth fixing regardless.**
+`VideoPlayer`'s `Events.ERROR` handler originally only ever acted on
+*fatal* errors, matching hls.js's own documented recovery pattern exactly
+(`startLoad()` on network, `recoverMediaError()` on media, destroy
+otherwise). But a non-fatal `levelLoadError` on the level hls.js picks to
+start with can leave the stream permanently stalled at zero buffered data
+even after a sibling level's playlist has loaded — hls.js doesn't retry that
+specific case on its own. Added a capped retry (`hls.startLoad()`, three
+attempts) for non-fatal network errors too. This is a legitimate hardening
+independent of what caused the original error — a real transient blip
+against any HTTP resource can produce the identical non-fatal, no-recovery
+gap.
+
+**The real bug, found only once verification moved to a real foregrounded
+tab.** `.ts` segment responses — but never `.m3u8` playlist responses —
+carried **two** `Access-Control-Allow-Origin` headers: nginx's own
+`add_header ... always` plus one LocalStack's S3 emulation adds on some
+objects. A response with two ACAO values is invalid under the CORS spec,
+and every real browser rejects it outright
+(`net::ERR_FAILED` — *"the 'Access-Control-Allow-Origin' header contains
+multiple values '\*, \*', but only one is allowed"*). `curl` and every
+server-side check up to this point reported a clean `200 OK` with a single
+header, because neither enforces CORS at all — which is exactly why nothing
+short of an actual browser fetch could ever have surfaced this. Fixed with
+`proxy_hide_header` on every `Access-Control-*` header in
+`infra/edge/nginx.conf`'s `/media/` location before `proxy_pass`, so the
+edge — the CDN boundary — is the sole source of the public CORS contract
+regardless of what the origin sends underneath it.
+
+The methodological point survives the specific bug: **a proxy in front of a
+third-party origin should never assume the origin sends none of the headers
+it itself intends to own.** It should `hide` and replace, not `add` and
+hope.
+
+### 11.6 The resumable upload UI
+
+`useResumableUpload` ports `web/debug/index.html`'s proven multipart flow
+into a real hook, and the port is close to mechanical because §9's design
+already put every hard part on the server: open the upload, ask
+`GET /uploads/{id}` which parts already landed, presign and PUT only the
+gaps straight to S3 with bounded concurrency (four workers), report each
+ETag back, complete once everything is in. `getUploadStatus` being the
+first call on every resume — never an assumption about what the client
+already sent — is what makes "resume after a pause" and "resume after a
+browser reload" the exact same code path as starting fresh.
+
+Resuming across a *reload* needs one more thing a pause doesn't: the
+in-flight session state has to outlive the JavaScript that was holding it.
+`localStorage` holds `{uploadId, videoId, partSizeBytes, totalParts,
+fileName}` — deliberately never the file itself, which the browser has no
+way to re-read from disk without the viewer picking it again. `UploadForm`
+detects a persisted session on mount and asks for the same file back rather
+than silently starting a second, competing upload for the same video.
+
+`ensureMyChannel` lazily provisions the guest viewer's one implicit channel
+the first time an upload actually needs one, rather than eagerly alongside
+the guest user itself — the same get-or-create shape `ViewerProvider` uses
+one layer down. One piece of debug-harness language slipped into the real
+UI and was worth catching on review: the pause control was still labelled
+"Simulate drop," a name that means something to someone testing resilience
+and nothing to someone just trying to pause an upload.
+
+### 11.7 A real home feed and search, closing a loop the backend already had
+
+The home page was a placeholder through phase 5 ("the home feed isn't built
+yet"), and `GET /search` had existed and been verified since phase 5 without
+the frontend ever calling it. Both close in this phase with the same shared
+building block: `VideoCard`/`VideoGrid`, a responsive tile layout neither
+page had to invent twice.
+
+Catalog's video-list DTO carries a `channelId`, not a channel name — the
+home feed needs the name for every card. The tempting shortcut is one
+Identity call per video; `hydrateChannelNames`
+(`lib/api/channel-hydration.ts`) instead resolves one call per **distinct**
+channel id on the page (`Promise.all` over a deduplicated set, since a real
+feed page routinely repeats the same channel across several uploads) — the
+same batch-not-per-row instinct §7's `POST /users:batch` and §10.9's
+`POST /videos/batch` already apply, just assembled client-side against an
+endpoint (`GET /channels/{id}`) that was never designed as a batch endpoint
+itself. A channel Identity can't resolve degrades that one card's name to
+null, the identical "hydration failure degrades one field, not the whole
+page" choice §11.2's `IIdentityReadClient` already makes for the watch page.
+
+Search results have no `channelId` at all on the wire — `SearchHit` was
+designed around what the inverted index actually stores, not around what a
+grid card would eventually want. A search card renders without a channel
+name rather than paying for an extra per-hit fetch of the full video record
+just to backfill one field it was never contracted to have.
+
+**A second real bug the redesign surfaced, not introduced.** A
+`thumbnailUrl` being non-null on the wire is not a guarantee the image
+actually loads — the underlying S3 object can be missing (see the
+environment note below about LocalStack's free tier not persisting S3
+across a restart) independent of whatever Catalog's own record says. The
+grid originally rendered a browser's default broken-image icon in that
+case. `VideoThumbnail` is a small client component specifically because
+`onError` needs to run in the browser: it falls back to the same
+placeholder a genuinely missing URL gets, so a broken image and an absent
+one are indistinguishable to the viewer rather than one looking like a bug
+and the other looking intentional.
+
+### 11.8 What phase 6 does not do
+
+- **No subscribe button, no channel page.** Identity's schema already tracks
+  a `subscriberCount`, but nothing in this phase writes to it or reads a
+  per-viewer subscription state — building a button that looks real but does
+  nothing would be a worse UI than omitting it.
+- **No real avatar images.** No channel in this system has ever had a
+  populated `avatarUrl`. `Avatar` renders deterministic-colour initials
+  instead — a real placeholder convention, not a broken-image workaround
+  like §11.7's thumbnail fix, since there was never a URL to fail loading in
+  the first place.
+- **No recommendations, no "up next," no channel-owner comment moderation.**
+  The last of these is the same cross-service-ownership gap §10.11 already
+  names for Catalog and Engagement — a frontend has no data to build a
+  feature the backend was never given the authority to serve.
+
+---
+
+## 12. Verification
 
 Everything below was run and passed on 2026-08-07.
 
@@ -2127,15 +2352,67 @@ word_similarity fix            plain similarity() missed a real single-word titl
                                 word_similarity() found it, same GIN index
 ```
 
+```bash
+# --- Phase 6: the Gateway BFF -----------------------------------------------
+curl -s "http://localhost:8080/api/watch/<videoId>"                    # anonymous
+curl -s "http://localhost:8080/api/watch/<videoId>" -H "X-JameX-User: <userId>"
+# → same video, but viewerReaction reflects that user's own reaction
+
+# --- Phase 6: the CORS bug, before/after ------------------------------------
+curl -s -D - -o /dev/null "http://localhost:8090/media/videos/<id>/360p/seg_000.ts" \
+  -H "Origin: http://localhost:3000" | grep -i access-control-allow-origin
+# → before the fix: TWO "Access-Control-Allow-Origin: *" lines (a real browser
+#   rejects this outright; curl does not, which is why this needed a real
+#   browser's network tab to ever surface)
+# → after the fix (infra/edge/nginx.conf's proxy_hide_headers): exactly one
+
+# --- Phase 6: resumable upload, exercised through the real UI ---------------
+# web/upload — pick a file, watch the per-part grid fill in, click "Pause"
+# mid-upload, then "Resume": the parts already landed stay green and only the
+# gap re-sends — the identical claim §9's debug-harness verification made,
+# now proven through the real Next.js form instead of the harness.
+
+npm --prefix web run lint
+npm --prefix web run build   # production build, full type-checking
+```
+
+**Verified, 2026-09-16:**
+
+```
+BFF aggregation      anonymous GET /api/watch/{id} → channel name, zeroed counts,
+                      viewerReaction: null in one call; with X-JameX-User after a real
+                      like/view, same endpoint reflects updated counts AND the
+                      caller's own reaction, anonymous call for the same video unaffected
+viewer identity       first browser visit made a genuine cross-origin POST /users
+                      (CORS preflight → 204 → 201); reload made ZERO new /users calls
+reactions             optimistic Like/Dislike/switch/un-react all confirmed against
+                      Engagement directly, not just the UI; reload after liking now
+                      shows the active highlight (previously did not — the cookie fix)
+comments UI           tombstoned comment reloaded shows no stale Edit/Delete controls
+                      (previously did, before isCommentDeleted() checked the text itself)
+hls.js playback       real FFmpeg-encoded stream: manifest + real levels parsed;
+                      video.readyState stayed 0 in every automated (backgrounded) tab;
+                      played end to end once tested in the user's own foregrounded tab
+CORS duplicate header .ts segments carried two Access-Control-Allow-Origin values;
+                      curl and PowerShell's own HTTP client never saw a problem;
+                      every real browser rejected it outright until proxy_hide_header
+                      made nginx the sole source of the response's CORS headers
+resumable upload UI   real file uploaded end to end through /upload; Pause mid-upload
+                      then Resume continued from exactly the parts still missing
+home feed + search    responsive grid from real GET /videos and GET /search; a video
+                      missing its S3 thumbnail object rendered the placeholder tile,
+                      not a broken-image icon, after VideoThumbnail's onError fallback
+```
+
 ---
 
-## 12. Interview talking points
+## 13. Design talking points
 
-Rehearse these aloud. Each is answerable from what is actually built.
+A quick-reference pass. Each is answerable from what is actually built.
 
 > **[`DESIGN.md`](DESIGN.md)** holds the fuller version — the decision register,
-> a failure-mode table, and the question bank grouped by theme. Use this section
-> for a quick pass and `DESIGN.md` before an interview.
+> a failure-mode table, and the Q&A bank grouped by theme. Use this section
+> for a quick pass and `DESIGN.md` for the deeper one.
 
 **"How do you handle the write volume on view counts?"**
 Sharded counters in DynamoDB. One item per video is a hot partition capped near
@@ -2358,9 +2635,59 @@ trade-off demonstrable: exact-token AND-matching with no typo tolerance on
 one side, typo-tolerant substring matching with no multi-term boolean logic
 on the other.
 
+**"Where does aggregation belong — in the client, or behind an API?"**
+Behind an API, and specifically behind a BFF built for the page that needs
+it, not a generic one. A browser fetching from Catalog, Engagement, and
+Identity separately means three round trips, three failure points the
+client has to reconcile, and every one of those services' internal
+addresses exposed to the public internet. `GET /api/watch/{id}` is the
+Gateway making those three calls itself — two of them concurrently — and
+handing back one response. The client gets one request to reason about; the
+services stay unreachable from outside the cluster.
+
+**"A page needs a foreign key's display name for every row in a list —
+video → channel name, order → customer name, that shape. How do you avoid
+N+1?"**
+Batch by the *distinct* foreign key, not by row. A feed of 24 videos from 6
+channels needs 6 lookups, not 24, because several videos share a channel.
+Collect the unique ids, fire them in parallel, build a map, then merge —
+the same instinct that motivates a dedicated batch endpoint (this system
+already has two: user lookup and video hydration), except here it's
+assembled client-side against an endpoint that's just a plain by-id GET,
+because the caller — not the resource itself — is the one that knows the
+requests are going to repeat.
+
+**"Why would a proxy sitting in front of a third-party origin need to strip
+headers the origin sends, rather than just adding its own on top?"**
+Because two conflicting values for the same header is often *worse* than
+one wrong value, not better — a response with two
+`Access-Control-Allow-Origin` headers isn't ambiguous to a spec-compliant
+browser, it's rejected outright, even when both values are identical
+wildcards. If a proxy owns the public contract for a header, it has to
+`hide` whatever the origin sends and set its own, not just append — "the
+origin probably doesn't set this" is an assumption a proxy in front of
+someone else's system doesn't get to make, and the failure mode when it's
+wrong is invisible to any tool that doesn't itself enforce that same
+policy, which is most of them.
+
+**"How do you make a player library's error recovery actually robust, not
+just handle the cases you've seen?"**
+Match the library's own documented recovery contract for its fatal error
+categories exactly — that part is usually well specified. Then separately
+ask what happens on the errors it reports as *non-fatal*: a library that
+decides an error isn't fatal is making a claim that the system can keep
+running, not a guarantee that it will keep making progress on its own. Here,
+a non-fatal error on the level a player picked to start with could stall
+playback forever with zero further attempts, because the library's own
+retry policy for that specific case had already been exhausted before the
+error ever reached application code. The fix isn't a library-specific
+workaround; it's the general lesson — "non-fatal" and "will recover
+unattended" are two different claims, and treating them as the same one is
+exactly how a transient blip becomes a permanent, silent failure.
+
 ---
 
-## 13. Roadmap
+## 14. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -2369,8 +2696,8 @@ on the other.
 | **3** | Identity + Catalog: EF Core models, migrations, REST APIs, event handlers, inbox + outbox, cache-aside | ✅ **Done, verified** |
 | **4** | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ✅ **Done, verified** |
 | **5** | Engagement + Search: sharded counters, idempotent reactions, comments, DynamoDB inverted index, Postgres trigram FTS comparison | ✅ **Done, verified** |
-| 6 | Gateway BFF aggregation + Next.js frontend with hls.js adaptive player | ⬜ Next |
-| 7 | `DESIGN.md` — doc-to-code mapping and interview question bank | ⬜ |
+| **6** | Gateway BFF aggregation, Next.js frontend, hls.js adaptive player, resumable upload UI, home feed, search | ✅ **Done, verified** |
+| 7 | `DESIGN.md` — doc-to-code mapping and design Q&A | ⬜ Next |
 
 Stretch goals once the pipeline is end to end: per-shot encoding (chapter 5),
 duplicate detection via perceptual hashing / LSH (chapter 4), optimistic

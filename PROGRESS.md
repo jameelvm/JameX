@@ -39,10 +39,23 @@ and *Next up* sections at the end of every session.
 
 ## Current state
 
-**Last updated:** 2026-09-15
+**Last updated:** 2026-09-16
 **Phases 1–5: COMPLETE, verified, documented in README.md and DESIGN.md.**
-**Phase 6 in progress: Gateway BFF aggregation (the watch page) built and
-verified end to end. Next: the Next.js frontend.**
+**Phase 6: COMPLETE.** Gateway BFF aggregation, reactions, comments UI,
+hls.js segment playback, the resumable upload UI, a real home feed, search
+results, and a light YouTube-like theme are all done and verified live —
+uploading a real file, browsing the home feed, searching, and watching a
+video all work end to end in a real browser.
+**Phase 7: COMPLETE.** `DESIGN.md` grew a doc-to-code map (§7) tying every
+named concept in the five spec chapters to the file(s) that implement it,
+the one-line reason this build made that choice, and the decision-register
+entry with the full argument — including a "Designed, not built" table for
+concepts named on purpose rather than overlooked. Also reframed
+interview-prep language out of `README.md`/`DESIGN.md` at the owner's
+request (renamed "Interview talking points"/"Interview question bank" to
+"Design talking points"/"Design Q&A bank", dropped "before an interview"
+phrasing) — the content is unchanged, only the framing, since this repo may
+be visible to colleagues.
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
@@ -486,15 +499,329 @@ Rationale kept in `README.md` §"Why seven services".
       video still correctly showed `viewerReaction: null` alongside the
       same updated counts. A nonexistent video id returned 404.
 
+- [x] **Next.js app scaffolded; watch page reading real data (read-only).**
+      `web/` (sibling to `web/debug`, which stays as the separate debug
+      harness) — App Router, TypeScript, Tailwind v4, ESLint. Next.js
+      16.3.5: this version postdates training knowledge (its own generated
+      `AGENTS.md` says so), so the `vercel:nextjs` skill's reference docs
+      were read before writing any code rather than assuming Next 14/15
+      conventions still applied — async `params`, RSC boundary rules,
+      React's `cache()` for request-level dedup all confirmed current.
+
+      Layering, deliberately: `types/video.ts` mirrors
+      `JameX.Contracts.Dtos.VideoDetail` field-for-field (enum numeric
+      values kept in lock-step with `JameX.Contracts.Enums` — confirmed
+      against real wire output, not assumed, since System.Text.Json here
+      serialises enums as numbers); `lib/api/client.ts` is the one place
+      every Gateway call goes through (`apiFetch`/`apiFetchOrNull`, an
+      `ApiError` carrying status); `lib/api/watch.ts` wraps the specific
+      `GET /api/watch/{id}` call in React's `cache()` so
+      `generateMetadata` and the page component — which both need the same
+      video — share one fetch per request instead of two; small focused
+      presentational components (`VideoPoster`, `ChannelByline`,
+      `EngagementSummary`, `VideoTags`, `ProcessingNotice`) instead of one
+      large page file. `EngagementSummary`'s props are already shaped for a
+      later interactive wrapper rather than a rewrite, once reactions become
+      clickable.
+
+      `next.config.ts` allow-lists the CDN origin (`localhost:8090`) for
+      `next/image`. Added a custom `not-found.tsx` after finding Next's
+      built-in 404 fallback renders outside this app's dark theme entirely —
+      a real gap, caught by actually looking at it, not assumed away.
+
+      **Verified in a real browser** (Claude in Chrome), not just curl: a
+      genuine video pushed through the real event pipeline, with a real
+      recorded view and like, rendered correctly end to end — title,
+      channel name, publish date, live counts, the viewer's own reaction
+      visibly highlighted, description (multi-paragraph, confirmed
+      `whitespace-pre-line` preserves the break), and tags. A nonexistent
+      video correctly hit the custom dark-themed not-found page. Along the
+      way, found (via the browser's network panel, not assumed) that the
+      poster image 400'd — traced to the test event's `poster.jpg`
+      genuinely not existing in S3, since no real Encoder run ever produced
+      it; not an application bug. `npm run lint` and `npm run build`
+      (production, with full type-checking) both pass clean.
+
+- [x] **Viewer-identity stub — a real Identity user behind `localStorage`.**
+      `ViewerProvider` (`components/viewer/`) provisions one on first visit
+      (`createGuestUser` → real `POST /users`), persists `{userId,
+      displayName}` in `localStorage`, and reuses it on every later visit —
+      no duplicate account per page load. `useViewer()` exposes it to any
+      client component; `SiteHeader` shows the current guest name and
+      doubles as a manual "switch identity" control (`resetViewer`), which
+      turned out to be genuinely useful for testing multi-viewer
+      interactions in one browser, not just a nice-to-have.
+
+      **A real architecture bug caught before it shipped, not after:** the
+      first draft of `createGuestUser` reused the Server-Component-only
+      `apiFetch` (reads a non-`NEXT_PUBLIC_` env var, invisible to the
+      browser bundle) from a function that only ever runs in the browser.
+      Fixed by splitting the shared request/error-handling core
+      (`lib/api/errors.ts`) out from two thin, context-specific clients —
+      `lib/api/client.ts` (server, `GATEWAY_BASE_URL`) and
+      `lib/api/browser-client.ts` (browser,
+      `NEXT_PUBLIC_GATEWAY_BASE_URL`) — rather than one client silently
+      doing the wrong thing in one of its two contexts.
+
+      **Verified in a real browser**: first visit made a genuine
+      cross-origin `POST http://localhost:8080/api/users` from the page at
+      `localhost:3000` (CORS preflight `OPTIONS` → 204, then `201`),
+      displayed the new guest's name in the header; reloading the page made
+      **zero** new requests to `/users` and showed the same guest — proving
+      the localStorage read path, not just the create path; clicking the
+      guest name cleared storage and provisioned a visibly different guest.
+      `npm run lint` and `npm run build` both pass clean.
+
+- [x] **Reactions wired up — Like/Dislike are real, clickable buttons.**
+      `EngagementSummary` was split into `ViewCommentStats` (stays plain
+      presentation) and a new `ReactionButtons` client component that owns
+      like/dislike entirely: seeded from the server-rendered
+      `VideoDetail`, then manages its own state — optimistic update on
+      click, roll back to the pre-click snapshot on failure. Click logic is
+      toggle-aware: clicking the already-active reaction calls `DELETE
+      .../reactions/me` (un-react); clicking the other one calls `PUT`
+      (set or switch) — a small pure `applyReactionChange` helper computes
+      the counts delta for every case (fresh, switch, remove) so the
+      component itself only ever calls one function, never open-codes the
+      arithmetic. `lib/api/reactions.ts` added the client calls;
+      `lib/api/errors.ts` gained `requestVoid` after discovering the shared
+      core unconditionally called `.json()` — which throws on the 204
+      empty body these endpoints actually return.
+
+      **A second real gap found by actually reloading the page, not
+      assumed away:** after clicking Like and reloading, the count was
+      right but the button never showed as active. Root cause: the watch
+      page's data comes from a Server Component `fetch`, which runs on the
+      Node process with no access to the browser's `localStorage` — so the
+      Gateway request was always anonymous and `viewerReaction` was always
+      null from the server's point of view, no matter what the browser's
+      guest had actually done. Fixed by mirroring just the viewer id into a
+      cookie (`lib/viewer/cookie.ts` writes/clears it, `server-viewer.ts`
+      reads it via `next/headers` — kept in separate files since one uses
+      browser-only `document.cookie` and the other server-only `cookies()`,
+      and mixing them would break bundling in one direction or the other).
+      `getWatchPage` and the page component now forward that cookie as
+      `X-JameX-User`, which `WatchAggregationService` on the Gateway already
+      knew how to use — no backend change needed, only the frontend was
+      missing a way to tell the server who was asking.
+
+      **Verified in a real browser, every transition, checked against the
+      backend directly (not just the UI):** click Like → button highlights,
+      `GET .../counts` on Engagement directly confirms `likes:1`; click
+      Dislike → switches in one click, confirmed `likes:0, dislikes:1`;
+      click Dislike again → un-reacts, confirmed both back to `0`; reload
+      after liking → the active highlight now survives a fresh
+      server-rendered load, which it did not before the cookie fix. `npm
+      run lint` and `npm run build` both pass clean; no console errors on
+      any of the above.
+
+- [x] **Comments UI — post, reply, edit, delete, one level deep.**
+      `CommentsSection` (top-level list, seeded from the server-rendered
+      first page, `Load more` for the rest) → `CommentItem` (one comment's
+      own text/edit/delete, agnostic to whether it's top-level or a reply)
+      → `ReplyThread` (fully self-contained: lazy-loads replies on
+      "View replies", owns the reply composer, never shares state with
+      `CommentsSection` because a reply is never rendered anywhere else).
+      One `CommentComposer` handles new top-level comments, new replies,
+      *and* editing — the same form, pre-filled via `initialText` for the
+      edit case, since all three only differ in what `onSubmit` does with
+      the text.
+
+      **Two real gaps found by actually clicking through it, not assumed
+      away:**
+      1. `deleteComment`'s 204 response can't say whether the backend
+         tombstoned or hard-deleted — documented explicitly, and handled by
+         always showing `[deleted]` locally, which is correct either way
+         without a follow-up fetch.
+      2. Bigger one: after reloading a page containing a tombstoned comment,
+         Edit/Delete controls **reappeared** on it. Root cause: the backend's
+         tombstone convention is the literal string `"[deleted]"` in
+         `comment.text` — there is no separate `isDeleted` field on the
+         wire — and the frontend's local "did I just delete this" flag only
+         covered comments deleted *in this session*, not ones that arrived
+         from the server already tombstoned (by an earlier session, or by
+         someone else). Fixed with a shared `isCommentDeleted()` check
+         (`lib/comments.ts`) used as the fallback wherever a comment renders,
+         not just a client-local flag.
+
+      **Verified in a real browser, checked against the backend at every
+      step**: posted a top-level comment (appeared instantly, confirmed via
+      `GET .../comments`); replied to it (nested correctly, confirmed via
+      `GET .../replies`); edited the top-level comment (`isEdited` flipped,
+      text updated); deleted the top-level comment **while its reply still
+      existed** — tombstoned correctly (`[deleted]`, no Edit/Delete, Reply
+      still available, the reply untouched); deleted the reply itself (a
+      leaf) — confirmed hard-deleted via a direct `GET .../replies` call
+      returning empty; **reloaded and confirmed the tombstone fix**: no
+      stale Edit/Delete controls, "No replies yet" correctly shown for the
+      now-empty thread. `npm run lint` and `npm run build` both clean, no
+      console errors through any of it.
+
+- [x] **hls.js player — built, wired up, code-verified against a real encode.**
+      `VideoPlayer` (client component: owns the `<video>` element and the
+      `Hls` instance lifecycle, one instance per video via `key={videoId}`)
+      + `QualitySelector` (a plain controlled `<select>`, no hls.js
+      knowledge — just reports a chosen level index back up). Feature-detects
+      `Hls.isSupported()` for everything except Safari, which gets a plain
+      `video.src = masterPlaylistUrl` since it plays HLS natively with no
+      quality-switching hook to offer. Error handling matches hls.js's own
+      documented recovery pattern exactly (`startLoad()` on a fatal network
+      error, `recoverMediaError()` on a fatal media error, otherwise
+      destroy and show a message) — verified against the actually-installed
+      1.7.3 package's own `.d.ts`, not assumed from training knowledge,
+      since this Next.js project's own generated `AGENTS.md` had already
+      flagged that its dependencies postdate that knowledge.
+
+      **Verified against a genuinely FFmpeg-encoded stream, not synthetic
+      event data**: generated a real test clip via `docker exec
+      jamex-encoder ffmpeg ...`, uploaded it to `jamex-raw` at the right key,
+      and published a real `VideoUploaded` straight to Catalog and Encoder —
+      letting the *actual* pipeline run (no hand-crafted `VideoEncoded`
+      this time). Encoder produced a real 2-rung ladder (240p/360p, capped
+      at the 360p source — no upscale) and published a real `VideoEncoded`
+      that fanned out over the real SNS topic to Catalog (Ready) and
+      Engagement (counters initialised) with zero manual intervention.
+      Loading the watch page confirmed hls.js fetched and parsed the real
+      master playlist and populated real levels — the quality selector
+      showed the actual `["360p", "240p"]` parsed from the manifest, not
+      placeholder data.
+
+- [x] **Segment playback — root-caused and fixed (2026-09-16).** The
+      previous session's "503s, but only from hls.js's own loader" finding
+      turned out to be two separate things, neither of them what it looked
+      like:
+
+      1. **A testing-harness artifact, not a bug.** Every tab
+         Claude-in-Chrome drives is a background tab in the user's real
+         Chrome window (by design — automation doesn't steal foreground
+         focus). `document.visibilityState` is `"hidden"` for such a tab,
+         and hls.js's `StreamController.doTickIdle()` (in
+         `node_modules/hls.js/dist/hls.js`) exits immediately whenever
+         `this.buffering` is false / the tab isn't driving playback,  so the
+         manifest and level playlists loaded fine but no fragment request
+         was ever issued — `video.readyState` sat at 0 forever. This is why
+         curl, PowerShell's own HTTP client, and even plain `fetch()`/`XHR`
+         calls made from *inside* the same page all succeeded reliably: none
+         of them go through hls.js's tick loop. Confirmed directly by
+         reading `hls.streamController.state` (`"IDLE"`) and
+         `document.visibilityState` (`"hidden"`) on a live instance.
+      2. **A real, deterministic bug, found once the user tested in their
+         own foregrounded tab**: `.ts` segment responses (but not `.m3u8`
+         ones) carried **two** `Access-Control-Allow-Origin` headers —
+         nginx's own `add_header ... always` plus one LocalStack's S3
+         emulation adds on certain objects. A response with two ACAO
+         values is invalid per the CORS spec and every browser rejects it
+         outright (`net::ERR_FAILED`, "contains multiple values '*, *'") —
+         curl and server-side tools never notice, since neither enforces
+         CORS, which is exactly why every earlier curl-based check missed
+         it. **Fixed** in `infra/edge/nginx.conf`: the `/media/` location
+         now `proxy_hide_header`s every `Access-Control-*` header before
+         `proxy_pass`, so nginx — the CDN edge — is the sole source of the
+         public CORS contract regardless of what the origin sends.
+
+      **A real, independent hardening also came out of the false trail**:
+      `VideoPlayer`'s `Events.ERROR` handler previously only ever acted on
+      *fatal* errors. hls.js can leave a stream permanently stalled after a
+      non-fatal `levelLoadError` on the level it picked to start with, even
+      once a sibling level's playlist has loaded successfully — it doesn't
+      retry that case on its own. Added a capped retry (`hls.startLoad()`,
+      max 3 attempts) for non-fatal `NETWORK_ERROR`s, independent of the
+      CORS fix above and worth keeping regardless of its root cause, since a
+      real transient blip against any HTTP resource can produce the exact
+      same non-fatal/no-recovery gap.
+
+      **Verified**: real segment fetch from the user's own foregrounded tab
+      showed the duplicate-header CORS error before the fix and a single
+      `Access-Control-Allow-Origin: *` after it (confirmed via `curl -D -`
+      against the exact `.ts` URL, cache bypassed); the user confirmed the
+      video actually plays end to end after reloading. Lint and production
+      build both clean.
+
+- [x] **Resumable upload UI — already built in an earlier, undocumented
+      session; verified live and closed out here.** `useResumableUpload`
+      (`hooks/use-resumable-upload.ts`) is the full port of
+      `web/debug/index.html`'s logic promised in this file's earlier
+      "Next up" entries: open the upload, ask Ingest which parts already
+      landed (`getUploadStatus` — the single call that makes "resume after
+      a pause" and "resume after a reload" the same code path as a fresh
+      upload), presign and PUT the gaps straight to S3 with bounded
+      concurrency (4 workers), report each ETag back, complete once every
+      part is in. Session identity (`uploadId`/`videoId`/part layout, never
+      the file itself — `localStorage` cannot hold that across a reload)
+      persists via `lib/upload/persisted-session.ts`; `ensureMyChannel`
+      (`lib/upload/ensure-channel.ts`) lazily provisions the guest viewer's
+      one implicit channel the first time an upload actually needs it,
+      mirroring `ViewerProvider`'s own get-or-create shape.
+      `UploadPageClient` routes between the picker, live per-part progress
+      grid, and post-upload pipeline-status poll purely off this hook's
+      state — no upload logic of its own. Found and fixed one leftover from
+      the debug harness while reviewing it: the pause button was still
+      labelled "Simulate drop", a developer-testing name that means nothing
+      to a real viewer; renamed to "Pause".
+
+      **Verified live, end to end, by the user in their own browser**: a
+      real file uploaded through `/upload` from picker to pipeline-status;
+      **Pause** mid-upload and **Resume** picked back up from exactly the
+      parts still missing, not from scratch.
+
+- [x] **Light theme + real home feed + search — this session.** The app was
+      dark-themed with a placeholder home page ("the home feed isn't built
+      yet") and a `/search` endpoint the frontend never called at all.
+      Rebuilt the browsing chrome to look like a real video platform's,
+      white-background and Roboto rather than Geist/dark:
+      - `app/globals.css` / `app/layout.tsx`: light palette tokens, Roboto.
+      - `SiteHeader`: sticky top bar, a real search form (`GET /search`,
+        native form submission — no client JS needed to make search work),
+        Upload link, guest identity.
+      - **New home feed** (`app/page.tsx`): a responsive video grid
+        (1–4 columns) from Catalog's real `GET /videos`, hydrated with each
+        video's channel name via a new `hydrateChannelNames` helper
+        (`lib/api/channel-hydration.ts`) — one parallel Identity call per
+        *distinct* channel on the page, not per video, then merged in.
+        Mirrors the same "resolve it once, server-side, degrade to null on
+        failure" pattern the watch page's own `channelName` already uses.
+      - **New search results page** (`app/search/page.tsx`): the same grid
+        against Search's `GET /search`. `SearchHit` carries no `channelId`
+        on the wire, so a search card renders with no channel name rather
+        than an extra per-hit fetch just for that one field, or a
+        fabricated value.
+      - `VideoCard`/`VideoGrid`/`Avatar`: new shared components. `Avatar` is
+        a deterministic-colour initials circle — no channel in this system
+        has ever had a real `avatarUrl` populated, so this is what a real
+        platform's own placeholder does instead of a broken image or a
+        blank space.
+      - `VideoThumbnail`: found and fixed a real bug the redesign surfaced —
+        a `thumbnailUrl` being non-null on the wire is not a guarantee the
+        image actually loads (the object may never have been written; see
+        the LocalStack-doesn't-persist-S3 environment note below). The grid
+        originally rendered a browser's broken-image icon in that case.
+        Split into its own client component with an `onError` fallback to
+        the same placeholder a missing URL gets, so a broken image and a
+        genuinely absent one are indistinguishable to the viewer.
+      - Every other component (reactions, tags, comments, upload form,
+        not-found) recoloured to the same light palette — blue for primary
+        actions (comment, reply, start upload — matching a real platform's
+        own accent for those, not just an arbitrary choice), light grey for
+        secondary ones, a dark filled pill for an active reaction.
+
+      **Verified**: lint and production build clean after every step; the
+      user confirmed the redesigned pages render correctly and reported
+      (then confirmed fixed) the broken-thumbnail bug above from their own
+      browser — Claude-in-Chrome's own tabs run backgrounded (see the
+      hls.js entry above) and its connection to the browser was
+      additionally unresponsive for the second half of this session, so
+      this phase's UI verification leaned on the user's live browser more
+      than earlier phases could.
+
 ### Next up (immediate)
 
-The Next.js frontend: watch page with hls.js (consuming `GET
-/api/watch/{id}` and showing live rendition switching), and a resumable
-upload UI porting the logic already proven in `web/debug/index.html` into a
-real app. Comments still leaves one open thread worth returning to: a real
-system would let a channel owner moderate comments on their own videos,
-which Engagement cannot authorise today for the same cross-service-ownership
-reason Catalog cannot verify channel ownership (see Open questions below).
+Phases 6 and 7 have no more open items. One thing worth returning to:
+Comments still leaves one open thread — a real system would let a channel
+owner moderate comments on their own videos, which Engagement cannot
+authorise today for the same cross-service-ownership reason Catalog cannot
+verify channel ownership (see Open questions below). Otherwise, whatever the
+owner picks up next — a stretch goal from the roadmap, or a new feature
+outside the original five-chapter scope.
 
 ---
 
@@ -509,17 +836,43 @@ Ordered. Each phase leaves the build green **and** updates `README.md`.
 5. ~~Engagement and Search~~ — done. Sharded view counters, idempotent
    reactions, comments; DynamoDB inverted index plus a Postgres trigram FTS
    comparison. `README.md` §10 and `DESIGN.md` §3.7 written and current.
-6. **Gateway and frontend** — in progress. BFF aggregation for the watch page
-   (`GET /api/watch/{id}`) done and verified. Still needed: Next.js with
-   hls.js showing live rendition switching, resumable upload UI.
-7. **DESIGN.md** — deeper doc-to-code mapping, once phase 6 gives the Gateway
-   something real to map. The decision register, failure-mode table and
-   question bank are current through phase 5 already.
+6. ~~Gateway and frontend~~ — done. BFF aggregation, the viewer-identity
+   stub, interactive reactions, comments UI, hls.js playback, the resumable
+   upload UI, a real home feed, search results, and a light theme are all
+   done and verified end to end in a real browser.
+7. ~~DESIGN.md — deeper doc-to-code mapping~~ — done. §7 maps every named
+   concept in the five spec chapters to its implementation, its one-line
+   rationale, and the decision-register entry with the full argument, plus
+   a "Designed, not built" table for gaps named on purpose.
 
 ---
 
 ## Environment notes
 
+- **RESOLVED (2026-09-16) — the earlier "hls.js segment 503" entry above
+  was two things, not one, and neither was what it looked like.** See the
+  Phase 6 write-up above for the full account. Kept here as two standing
+  lessons:
+  - **Claude-in-Chrome tabs are backgrounded by design** (they don't steal
+    the user's foreground focus), so `document.visibilityState` is
+    `"hidden"` for anything tested through them. hls.js's stream controller
+    won't issue fragment requests in that state — `video.readyState` sits
+    at 0 forever even though the manifest and level playlists loaded fine.
+    **Playback through hls.js cannot be verified from an automated tab —
+    it needs a real foregrounded tab (ask the user to check, as here) or a
+    plain `fetch()`/`curl` check of the segment URLs instead.**
+  - **LocalStack's S3 emulation adds its own `Access-Control-*` response
+    headers on some objects** (observed on `.ts` segments, not `.m3u8`
+    playlists) — on top of nginx's own `add_header`s, producing two
+    `Access-Control-Allow-Origin` values, which every real browser rejects
+    outright per the CORS spec. `curl` and any server-side check never
+    notice this, since neither enforces CORS — this class of bug is only
+    ever visible from an actual browser fetch. Fixed with
+    `proxy_hide_header` in `infra/edge/nginx.conf`'s `/media/` location, so
+    the edge fully owns the CORS contract instead of layering onto
+    whatever the origin sends. **Any time a resource is proxied from
+    LocalStack (or any S3-compatible origin) through nginx, hide its
+    `Access-Control-*` headers rather than assuming it sends none.**
 - Docker Desktop must be running before `docker compose up`.
 - No FFmpeg on the host — baked into the encoder image, so all transcoding
   happens in Docker.

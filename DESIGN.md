@@ -6,12 +6,13 @@ able to answer from it. `README.md` explains *how it was built*; this explains
 *why it is shaped this way*.
 
 **How to use it.** Read §2 and §3 to reload the whole design in ten minutes.
-Read §5 before an interview — it is the question bank, with the answer compressed
-to the point you need to make.
+Read §5 when you need the deeper version — it is the Q&A bank, with the
+answer compressed to the point you need to make.
 
-**Status.** Covers phases 1–4 (infrastructure, service decomposition, Identity
-and Catalog, Ingest and Encoder). Sections marked ⬜ are designed but not yet
-built. This document grows at the end of every phase.
+**Status.** Covers phases 1–6 (infrastructure, service decomposition, Identity
+and Catalog, Ingest and Encoder, Engagement and Search, the Gateway and
+frontend). Sections marked ⬜ are designed but not yet built. This document
+grows at the end of every phase.
 
 ---
 
@@ -21,9 +22,10 @@ built. This document grows at the end of every phase.
 2. [Architecture](#2-architecture)
 3. [The decision register](#3-the-decision-register)
 4. [Failure modes and what defends against them](#4-failure-modes-and-what-defends-against-them)
-5. [Interview question bank](#5-interview-question-bank)
+5. [Design Q&A bank](#5-design-qa-bank)
 6. [Coverage map — what you can defend](#6-coverage-map--what-you-can-defend)
-7. [Glossary](#7-glossary)
+7. [Doc-to-code map](#7-doc-to-code-map)
+8. [Glossary](#8-glossary)
 
 ---
 
@@ -492,6 +494,124 @@ other cannot.
 
 ---
 
+### 3.8 Frontend and the Gateway as BFF (phase 6)
+
+---
+
+**One Gateway-owned aggregation endpoint, not a purely-proxying gateway**
+
+- *Alternative:* keep the Gateway a pure reverse proxy and let the browser
+  call Catalog, Engagement, and Identity separately for the watch page.
+- *Why:* three round trips instead of one, three failure points the client
+  has to reconcile itself, and every backing service's address exposed
+  directly to the public internet. `WatchController`/
+  `IWatchAggregationService` is the one deliberate exception to "every route
+  is a plain proxy rule": it calls Catalog first and alone (nothing to
+  aggregate onto without a video), then fans Engagement and Identity out
+  **concurrently** with `Task.WhenAll`, merging onto Catalog's record.
+  Failure handling is asymmetric on purpose — Catalog's client propagates a
+  fault (no video isn't a degradable state), Engagement's and Identity's
+  clients catch and return null (a watch page with stale counts or a
+  missing channel name is a visible degradation, not a broken page).
+- *Where:* `WatchController`, `WatchAggregationService`, `ICatalogReadClient`
+  / `IEngagementReadClient` / `IIdentityReadClient` (Gateway).
+
+---
+
+**A cookie mirrors the viewer id specifically for server-rendered requests**
+
+- *Alternative:* rely on `localStorage` alone, the way the guest identity is
+  otherwise persisted.
+- *Why:* the watch page's data comes from a Next.js Server Component
+  `fetch`, which runs on the Node process — with no access to the browser's
+  `localStorage` at all. Every server-rendered load was therefore anonymous
+  regardless of what the browser's guest had actually done, so a like never
+  showed as active after a reload even though it had genuinely landed.
+  `lib/viewer/cookie.ts` (browser-only `document.cookie`) and
+  `lib/viewer/server-viewer.ts` (server-only `next/headers`) are two files,
+  not one, because mixing a browser-only and a server-only API in the same
+  module breaks bundling in whichever direction wasn't tested. The cookie's
+  only job is reaching the server-side call as `X-JameX-User` — the exact
+  header `WatchAggregationService` already knew how to use.
+- *Where:* `lib/viewer/cookie.ts`, `lib/viewer/server-viewer.ts`,
+  `lib/api/watch.ts` (web).
+
+---
+
+**`hide` the origin's own CORS headers at the proxy, don't just `add` on top**
+
+- *Alternative:* trust that LocalStack's S3 emulation sends no
+  `Access-Control-*` headers of its own, and let nginx's `add_header`s be
+  the only ones on the wire.
+- *Why:* it does send its own, on some objects (`.ts` segments, not `.m3u8`
+  playlists) — and a response with two `Access-Control-Allow-Origin` values
+  is invalid per the CORS spec, rejected outright by every real browser,
+  even when both values are the identical wildcard. `curl` and every
+  server-side check reported a clean single-header `200 OK`, because
+  neither enforces CORS at all — the bug was invisible to anything except an
+  actual browser fetch. `proxy_hide_header` on every `Access-Control-*`
+  header in the `/media/` location, before `proxy_pass`, makes the edge —
+  the CDN boundary — the sole source of the public CORS contract regardless
+  of what the origin underneath it sends.
+- *Where:* `infra/edge/nginx.conf`, `/media/` location.
+
+---
+
+**A capped retry for *non-fatal* hls.js network errors, not just fatal ones**
+
+- *Alternative:* match only hls.js's own documented fatal-error recovery
+  pattern (`startLoad()` on network, `recoverMediaError()` on media) and
+  leave non-fatal errors unhandled, since the library itself doesn't
+  consider them fatal.
+- *Why:* "non-fatal" is a claim that the library can keep running, not a
+  guarantee it will keep making progress unattended. A non-fatal
+  `levelLoadError` on the level hls.js picked to start playback with can
+  leave the stream permanently stalled at zero buffered data even after a
+  sibling level's own playlist loaded successfully — hls.js's internal
+  retry policy for that specific case had already exhausted itself before
+  the error ever reached application code, and nothing further was
+  scheduled. A capped retry (`hls.startLoad()`, three attempts) on non-fatal
+  `NETWORK_ERROR`s closes that gap without turning a genuinely unreachable
+  source into an infinite retry loop.
+- *Where:* `VideoPlayer`'s `Events.ERROR` handler (web).
+
+---
+
+**Batch channel-name hydration by *distinct* id, assembled client-side**
+
+- *Alternative:* one Identity call per video row in the home feed.
+- *Why:* Catalog's video-list DTO carries a `channelId`, not a display name,
+  and a real feed page routinely repeats the same channel across several
+  uploads — fetching per row means real duplicate work, not just N+1 in the
+  abstract. `hydrateChannelNames` collects the *distinct* channel ids on the
+  page, resolves each with one parallel `GET /channels/{id}`, and merges the
+  result back by id. This is the identical batch-not-per-row instinct
+  behind Identity's `POST /users:batch` and Catalog's `POST /videos:batch`,
+  applied against an endpoint that was never built as a batch one — the
+  caller, not the resource, is what knows the requests will repeat. A
+  channel Identity can't resolve degrades that one card's name to null,
+  matching how `IIdentityReadClient` already degrades the watch page.
+- *Where:* `lib/api/channel-hydration.ts` (web).
+
+---
+
+**A thumbnail's own load failure is a client-side state, not just a null check**
+
+- *Alternative:* treat a non-null `thumbnailUrl` as sufficient — render an
+  `<img>` and let a broken one show the browser's own broken-image icon.
+- *Why:* `thumbnailUrl` being present on the wire is Catalog's record, not a
+  guarantee the underlying S3 object still exists (LocalStack's free tier
+  doesn't persist S3 across a stack restart — see the environment notes).
+  A broken-image icon reads as "this app is buggy"; a deliberate placeholder
+  reads as "no preview available," which is the true state either way.
+  `VideoThumbnail` has to be a client component specifically because
+  `<img onError>` only fires in the browser, and falls back to the exact
+  same placeholder a `null` URL gets, so a broken load and a genuinely
+  absent one are indistinguishable to the viewer.
+- *Where:* `components/video/video-thumbnail.tsx` (web).
+
+---
+
 ## 4. Failure modes and what defends against them
 
 The most useful way to hold the design in your head.
@@ -526,10 +646,15 @@ The most useful way to hold the design in your head.
 | 26 | An inverted-index consumer needs data an event doesn't carry | Denormalise the field into the event, not a synchronous callback | ✅ |
 | 27 | The inverted index's base table can't be queried by video id | A `by-video` GSI, same pattern as Engagement's reaction teardown | ✅ |
 | 28 | A short query scores too low against a long title in trigram search | `word_similarity()`, not plain `similarity()`, over the same GIN index | ✅ |
+| 29 | A response has two conflicting values for the same CORS header | `proxy_hide_header` at the proxy — hide the origin's, add exactly one of your own | ✅ |
+| 30 | A player's non-fatal error still leaves playback permanently stalled | Capped app-level retry (`startLoad()`) for non-fatal network errors too | ✅ |
+| 31 | A list needs N callers' display names, mostly repeating the same few | Batch by *distinct* id, resolved in parallel, merged back by id | ✅ |
+| 32 | A resource's URL is valid on the wire but the underlying object is gone | Client-side `onError` fallback, same placeholder a null URL gets | ✅ |
+| 33 | Personalised server-rendered data has no way to know who's asking | Mirror the client identity into a cookie the server *can* read | ✅ |
 
 ---
 
-## 5. Interview question bank
+## 5. Design Q&A bank
 
 Grouped by theme. The answer given is the *point to make* — expand from there.
 
@@ -797,6 +922,68 @@ sharpest way to show the gap live — it succeeds under trigram similarity and
 fails outright under exact-token matching, with the same underlying data on
 both sides.
 
+### Frontend and the Gateway as BFF (phase 6)
+
+**"Where should aggregation for a page that needs data from several
+services live?"**
+Behind an API built for that page, not scattered across the client as
+several separate calls. `GET /api/watch/{id}` is the Gateway calling
+Catalog, Engagement, and Identity itself — Catalog first and alone, then
+Engagement and Identity concurrently — and handing back one response. The
+alternative costs three round trips, three client-side failure points to
+reconcile, and every backing service's address exposed past the edge for no
+reason. Failure handling stays asymmetric even inside one aggregator: a
+failure that makes the page meaningless propagates, one that only degrades
+it returns null instead.
+
+**"You have a foreign key on every row of a list and need the referenced
+entity's display name. How do you avoid N+1 without a dedicated batch
+endpoint on the other side?"**
+Batch by the *distinct* key, not by row, assembled on the calling side. A
+video feed's channel ids repeat heavily — a handful of channels across
+dozens of uploads — so deduplicate first, then resolve each unique id in
+parallel and merge the results back by key. This doesn't need the resource
+owner to have built a batch endpoint; the caller is the one that knows the
+requests are going to repeat, and a plain by-id GET is enough to build the
+batching around.
+
+**"A proxy sits in front of a third-party origin you don't control. The
+response ends up with a header value you didn't intend. What's the fix?"**
+Don't assume the origin sends none of the headers you plan to set — hide
+whatever it sends and set your own explicitly. Two conflicting values for
+the same header can be *worse* than one wrong value: a response carrying
+two `Access-Control-Allow-Origin` headers is invalid per spec and a real
+browser rejects it outright, even when both values are the identical
+wildcard — while a tool that doesn't enforce that policy (`curl`, a
+server-side health check) sees a perfectly normal single-header response and
+reports nothing wrong. The lesson generalises past CORS: any header a proxy
+means to own should be actively stripped from the upstream response, not
+merely appended to.
+
+**"How do you make a third-party library's error recovery genuinely
+robust, beyond matching its documented recovery pattern?"**
+Match the documented fatal-error recovery exactly — that part is usually
+well specified and the library's own maintainers have already reasoned
+about it. Then separately ask what a *non-fatal* error actually promises:
+it means the library believes the system can keep running, not that it will
+keep making progress unattended. Here, a non-fatal error on the level a
+player picked to start playback with could leave it stalled permanently at
+zero buffered data, because the library's own retry policy for that case
+had already exhausted itself silently before the error reached application
+code. Treating "non-fatal" and "will self-heal" as the same claim is
+precisely how a transient blip turns into a permanent, silent failure.
+
+**"A page's data comes from a server-rendered request, but personalising it
+needs to know which client is asking. The client's identity lives in
+`localStorage`. What breaks, and how do you fix it?"**
+`localStorage` is a browser API — a server-rendered fetch runs on the
+server process and has no access to it, so every server-rendered load looks
+anonymous no matter what the browser actually knows. The fix is mirroring
+just the identity, not the whole client state, into something the server
+*can* read on that request — a cookie forwarded as a header the aggregation
+layer already expects. It's a narrow, purpose-built bridge between two
+execution contexts, not a redesign of where identity lives.
+
 ### Implementation-level
 
 **"Do you use the repository pattern with EF Core?"**
@@ -827,17 +1014,19 @@ repository and domain layers did not change by a line — which is the real poin
 | Caching strategy and invalidation | **Strong** | ✅ cache-aside |
 | Index design (partial, GIN, trigram, composite) | **Strong** | ✅ verified by EXPLAIN |
 | Race conditions, constraint-based correctness | **Strong** | ✅ |
-| N+1 across a network, BFF aggregation | Good | ✅ batch endpoints |
+| N+1 across a network, BFF aggregation | **Strong** | ✅ batch endpoints + a real Gateway BFF endpoint, verified live through a browser |
 | Queue mechanics: DLQ, visibility, retry budgets | Good | ✅ |
 | Pub/sub fan-out with filtering | Good | ✅ |
 | Back-of-envelope estimation | Good | — analysis only |
 | Sharded counters, hot partitions | **Strong** | ✅ verified: 10-way shard, 10 concurrent writes, correct sum |
-| Large-file upload, resumability | **Strong** | ✅ verified: concurrent parts, resume, idempotent completion |
+| Large-file upload, resumability | **Strong** | ✅ verified: concurrent parts, resume, idempotent completion — through both the debug harness and the real Next.js UI |
 | Transcoding, ABR ladder | **Strong** | ✅ verified: GOP alignment, no-upscale, real FFmpeg |
 | Data-plane / control-plane separation | **Strong** | ✅ bytes bypass the service; only metadata does not |
 | Inverted index vs relational FTS | **Strong** | ✅ verified: both live, typo tolerance demonstrated live on one, not the other |
 | Idempotent writes with no relational store (Dynamo-only services) | **Strong** | ✅ conditional writes + `ReturnValues=ALL_OLD`, both verified under concurrency |
-| Soft-delete / tombstoning to preserve referential structure | Good | ✅ comments |
+| Soft-delete / tombstoning to preserve referential structure | Good | ✅ comments, including the frontend correctly rendering a server-side tombstone it didn't create itself |
+| Adaptive playback client, ABR quality switching | **Strong** | ✅ verified: real levels parsed from a real encode, non-fatal-error recovery, played end to end |
+| Reverse-proxy header ownership (CORS at a CDN boundary) | Good | ✅ found and fixed a real duplicate-header bug a browser-only enforces |
 | CDN tiering by popularity | Designed | ⬜ phase 5–6 |
 | Database sharding, Vitess | Reading only | ⬜ not planned |
 | Auth, rate limiting, recommendations | Out of scope | ⬜ |
@@ -850,7 +1039,75 @@ prevents, and say what you verified.
 
 ---
 
-## 7. Glossary
+## 7. Doc-to-code map
+
+The design doc is five chapters: requirements and estimation (2), the actual
+design (3), evaluating that design's weak points (4), and the messier
+real-world caveats on top of it (5) — chapter 1 is scoping, not content.
+Every named concept from chapters 2–5 that this build addresses is listed
+below against the file(s) that implement it, the one-line reason *this*
+build made that choice, and the decision-register entry (§3) with the full
+argument. Concepts the doc raises but this build deliberately didn't
+implement are listed too, under **Designed, not built** — naming a gap on
+purpose is different from not knowing it exists.
+
+### Chapter 2 — Requirements and estimation
+
+| Concept | Why chosen here | Where | Full argument |
+|---|---|---|---|
+| Deriving RPS/storage/bandwidth from DAU, not reciting figures | Sizing decisions (fleet size, upload bandwidth) only mean something if you can re-derive them under different assumptions | §1 of this doc, README §1 | — |
+| Read-heavy skew (reads vastly outnumber writes) | Justifies every caching decision in chapters 3–4 — there'd be no point caching a workload that wasn't read-heavy | Redis cache-aside (Catalog), nginx edge cache | §3.3 |
+
+### Chapter 3 — Design
+
+| Concept | Why chosen here | Where | Full argument |
+|---|---|---|---|
+| Service decomposition by scaling signal, not by noun | Splitting by entity produces services that must call each other constantly; splitting by *what makes it scale* doesn't | Seven services — Gateway/Identity/Catalog/Ingest/Encoder/Engagement/Search | §2 "Seven services, split by scaling signal" |
+| One service, one store — no shared tables | The single rule that stops this becoming a distributed monolith; independent deployment dies the moment two services share a table | Separate Postgres databases per service, `AddJameXInboxTable`/`AddJameXOutboxTable` per owner | §2 "The rule that makes it a service architecture" |
+| Data-plane / control-plane split for uploads | Routing 600 MB uploads through the application tier makes the service the bottleneck at real ingest bandwidth | Presigned multipart PUT straight to S3; Ingest only issues credentials and tracks state | §3.6 |
+| Relational metadata store | Video metadata needs joins, filters, and ordering — the shape a KV store answers badly | Catalog's Postgres schema (`videos`, `renditions`) | §3.2 |
+| Sharded write-heavy counters | A single row caps out near 1,000 writes/sec; a viral video's view counter is the hottest key in the system | `VideoCounterRepository`, DynamoDB `jamex-video-counters` | §3.7 |
+| Inverted index for search | `term → videoId` is the only shape that answers "which documents contain this word" in one partition read | `SearchIndexRepository`, DynamoDB `jamex-search-index`, `Tokenizer` | §3.7 |
+| Object storage + CDN for video bytes | Petabyte-scale storage and CDN-addressable URLs are what a relational or KV store were never built for | S3 (`jamex-raw`, `jamex-media`), nginx edge with `proxy_cache_lock` | §2 "Storage, and why each store exists" |
+| Adaptive bitrate streaming (master + variant playlists) | A player needs to switch quality mid-playback without re-buffering from zero, which requires every rendition's segments to align in time | FFmpeg ABR ladder (forced GOP alignment), `VideoPlayer`/hls.js | §3.6 |
+| Cache-aside with explicit invalidation | Only cache something you can name the exact key to delete when it changes | Catalog's watch-page cache, delete-after-commit, 5-minute TTL floor | §3.3 |
+| Async messaging / pub-sub fan-out | A producer that doesn't know its consumers can grow new ones without a redeploy | One SNS topic (`jamex-video-events`), one SQS queue + DLQ per consumer, subscription filter policies | §3.1 |
+| Backend-for-frontend aggregation | A page needing several services' data shouldn't cost the browser several round trips, or expose every backing service publicly | `WatchController`/`WatchAggregationService` (Gateway) | §3.8 |
+
+### Chapter 4 — Evaluation (the design's own weak points)
+
+| Concept | Why chosen here | Where | Full argument |
+|---|---|---|---|
+| The dual-write problem (commit, then crash before publishing) | The doc names this as the sharp edge of "commit to a database, then tell everyone else" | Transactional outbox — event row written in the same transaction as the change | §3.1 |
+| At-least-once delivery, never exactly-once | SQS's own delivery guarantee — a consumer that assumes exactly-once will eventually double-apply something | Inbox pattern (`processed_events`, same transaction as the effect) | §3.1 |
+| Competing consumers safely claiming disjoint work | Two replicas of the same relay must not publish the same row twice | `SELECT … FOR UPDATE SKIP LOCKED` in the outbox dispatcher | §3.1 |
+| Poison-message isolation | One malformed message shouldn't starve a queue for every other message behind it | DLQ after 3 receives, 4-day retention | §4 (failure-mode table) |
+| CDN as a shield against origin overload | A viral video's first seconds without protection is a self-inflicted DDoS on the origin | `proxy_cache_lock` in `infra/edge/nginx.conf` | README §13 |
+| A reverse proxy owning its public response contract | The doc's CDN discussion assumes the edge fully controls what it serves — it doesn't automatically, if the origin also sets headers | `proxy_hide_header` on every `Access-Control-*` header before `proxy_pass` | §3.8 |
+
+### Chapter 5 — Reality is more complicated
+
+| Concept | Where this build actually lived it, not just read about it |
+|---|---|
+| "The client can't be trusted to report state honestly" | `getUploadStatus` — the resumable-upload client never assumes what it already sent; it asks the server and reconciles against that |
+| "A library's documented behaviour and its actual behaviour diverge" | hls.js's non-fatal errors don't self-heal the way "non-fatal" implies — found only by testing against a real encode, not by reading the docs. §3.8, §4 row 30 |
+| "A tool that doesn't enforce a rule will hide a real violation of it" | `curl` and every server-side check reported a clean response while a real browser rejected the same one outright — the duplicate-CORS-header bug. §3.8, §4 row 29 |
+| "An automated test's environment isn't the same as a real one" | A backgrounded browser tab silently starves a video player's internal scheduling loop — invisible to any check that doesn't run in a real, focused tab |
+
+**Designed, not built** — named on purpose, not overlooked:
+
+| Concept | Chapter | Why it's out of scope here |
+|---|---|---|
+| Database sharding via Vitess | 4 | Read replicas solve this build's actual read load; sharding by `channelId` is designed (§5) but never needed in practice at this scale |
+| CDN tiering by popularity | 3–4 | The single-tier edge cache already demonstrates the caching pattern; a popularity-aware second tier adds infrastructure without adding a new concept to defend |
+| Per-shot (per-segment) encoding | 5 | A genuine stretch goal — the fixed ABR ladder already demonstrates adaptive streaming end to end |
+| Duplicate detection via perceptual hashing / LSH | 5 | Out of scope — no content-similarity requirement in this build's six functional requirements |
+| Recommendations (candidate generation + ranking) | 5 | Explicitly out of scope from the start (README §1) — a genuinely different system, not an extension of this one |
+| Auth, rate limiting | 2, 4 | Named as stubbed from phase 2 onward (`ICurrentUser` is a header, not real auth) — a production Gateway would authenticate once and forward a signed identity |
+
+---
+
+## 8. Glossary
 
 | Term | Meaning here |
 |---|---|
