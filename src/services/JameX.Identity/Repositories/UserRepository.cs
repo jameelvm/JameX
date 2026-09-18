@@ -25,6 +25,9 @@ public interface IUserRepository
 {
     Task<User?> GetByIdAsync(Guid userId, CancellationToken ct);
 
+    /// <summary>The lookup login runs — served by <c>ix_users_email</c>, the same index that enforces uniqueness on write.</summary>
+    Task<User?> GetByEmailAsync(string email, CancellationToken ct);
+
     Task<IReadOnlyList<User>> GetManyAsync(IReadOnlyCollection<Guid> userIds, CancellationToken ct);
 
     Task<bool> ExistsAsync(Guid userId, CancellationToken ct);
@@ -44,6 +47,9 @@ internal sealed class UserRepository(IdentityDbContext db) : IUserRepository
 {
     public Task<User?> GetByIdAsync(Guid userId, CancellationToken ct) =>
         db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId, ct);
+
+    public Task<User?> GetByEmailAsync(string email, CancellationToken ct) =>
+        db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Email == email, ct);
 
     public async Task<IReadOnlyList<User>> GetManyAsync(
         IReadOnlyCollection<Guid> userIds, CancellationToken ct)

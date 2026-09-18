@@ -37,6 +37,14 @@ public static partial class Normalise
         && value.IndexOf('@') < value.Length - 1
         && !value.Contains(' ');
 
+    /// <summary>
+    /// A length floor only, deliberately. Composition rules ("must contain a
+    /// symbol") push users toward predictable substitutions and don't survive
+    /// contact with a real password manager; length is the one property that
+    /// actually correlates with resistance to guessing.
+    /// </summary>
+    public static bool IsValidPassword(string value) => value.Length is >= 8 and <= 200;
+
     /// <summary>Handles appear in URLs, so the character set is restrictive.</summary>
     public static bool IsValidHandle(string value) => HandlePattern().IsMatch(value);
 

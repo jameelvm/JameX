@@ -57,6 +57,23 @@ public sealed class VideosController(
         [FromQuery] int pageSize = CatalogRules.DefaultPageSize) =>
         (await videoQueryService.GetFeedAsync(page, pageSize, ct)).ToActionResult();
 
+    /// <summary>
+    /// "Your videos" — every status and privacy level, because this is the
+    /// one listing endpoint where the caller and the uploader are always the
+    /// same person. See <see cref="IVideoQueryService.GetMineAsync"/> for why
+    /// that makes it safe to skip the public/Ready filter every other list
+    /// endpoint applies.
+    /// </summary>
+    [HttpGet("mine")]
+    [ProducesResponseType<PagedResult<VideoSummary>>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    public async Task<IActionResult> GetMine(
+        CancellationToken ct,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = CatalogRules.DefaultPageSize) =>
+        (await videoQueryService.GetMineAsync(currentUser.RequireUserId(), page, pageSize, ct))
+            .ToActionResult();
+
     /// <summary>A channel's published videos, newest first.</summary>
     [HttpGet("/channels/{channelId:guid}/videos")]
     [ProducesResponseType<PagedResult<VideoSummary>>(StatusCodes.Status200OK)]

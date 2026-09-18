@@ -31,6 +31,14 @@ x-service-base: &service-base
     Storage__MediaBucket: "jamex-media"
     Storage__CdnBaseUrl: "http://localhost:8090/media"
     Messaging__TopicName: "jamex-video-events"
+    # Dev-only, committed the same way the Aws test credentials above are.
+    # Identity signs with this key at login; the Gateway verifies with the
+    # identical value — sharing the anchor is what guarantees they can never
+    # drift apart. A real deployment overrides this with a real secret.
+    Jwt__Issuer: "JameX.Identity"
+    Jwt__Audience: "JameX"
+    Jwt__SigningKey: "dev-only-signing-key-never-use-in-production-3f8a9c2e7b1d4f6a"
+    Jwt__ExpiryMinutes: "60"
   depends_on: &service-deps
     postgres:
       condition: service_healthy

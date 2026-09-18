@@ -34,7 +34,8 @@ public static class JameXHostingExtensions
         builder.Services
             .Configure<AwsOptions>(builder.Configuration.GetSection(AwsOptions.SectionName))
             .Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName))
-            .Configure<MessagingOptions>(builder.Configuration.GetSection(MessagingOptions.SectionName));
+            .Configure<MessagingOptions>(builder.Configuration.GetSection(MessagingOptions.SectionName))
+            .Configure<JwtOptions>(builder.Configuration.GetSection(JwtOptions.SectionName));
 
         builder.Services.AddJameXAwsClients();
         builder.Services.AddSingleton<IEventPublisher, SnsEventPublisher>();

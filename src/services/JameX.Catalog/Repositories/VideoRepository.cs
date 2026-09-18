@@ -43,6 +43,16 @@ public interface IVideoRepository
     Task<(IReadOnlyList<Video> Items, int Total)> GetByChannelAsync(
         Guid channelId, int page, int pageSize, CancellationToken ct);
 
+    /// <summary>
+    /// One uploader's own videos, every status and privacy level, newest
+    /// first — the "Your videos" list. Unlike <see cref="GetByChannelAsync"/>,
+    /// deliberately unfiltered by <c>Status</c>/<c>Privacy</c>: the whole point
+    /// is to show a private or still-transcoding video back to the person who
+    /// uploaded it.
+    /// </summary>
+    Task<(IReadOnlyList<Video> Items, int Total)> GetByUploaderAsync(
+        Guid uploaderId, int page, int pageSize, CancellationToken ct);
+
     /// <summary>Batch resolution for the Gateway, mirroring Identity's endpoints.</summary>
     Task<IReadOnlyList<Video>> GetManyAsync(IReadOnlyCollection<Guid> videoIds, CancellationToken ct);
 
@@ -118,6 +128,25 @@ internal sealed class VideoRepository(CatalogDbContext db) : IVideoRepository
             .Where(v => v.ChannelId == channelId
                         && v.Privacy == VideoPrivacy.Public
                         && v.Status == VideoStatus.Ready);
+
+        var total = await query.CountAsync(ct);
+
+        var items = await query
+            .OrderByDescending(v => v.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return (items, total);
+    }
+
+    public async Task<(IReadOnlyList<Video> Items, int Total)> GetByUploaderAsync(
+        Guid uploaderId, int page, int pageSize, CancellationToken ct)
+    {
+        // Ordered by CreatedAt to match ix_videos_uploader_id_created_at —
+        // same reasoning as GetByChannelAsync, minus the Privacy/Status
+        // filter that query needs and this one must not have.
+        var query = db.Videos.AsNoTracking().Where(v => v.UploaderId == uploaderId);
 
         var total = await query.CountAsync(ct);
 

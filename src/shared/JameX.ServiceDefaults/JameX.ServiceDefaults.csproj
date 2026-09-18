@@ -23,6 +23,7 @@
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
     <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.EntityFrameworkCore" Version="10.0.10" />
     <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.8.0" />
+    <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="8.22.0" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <!-- Pinned: 10.0.10 pulls Microsoft.OpenApi 2.0.0 transitively, which carries
          advisory GHSA-v5pm-xwqc-g5wc. 2.11.0 is the patched same-major release. -->

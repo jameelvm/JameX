@@ -35,6 +35,15 @@ public sealed class User
 
     public required string DisplayName { get; set; }
 
+    /// <summary>
+    /// Never the plaintext password, and never returned in any DTO — see
+    /// <see cref="Mapping.EntityMappings"/>'s remark on exactly this column.
+    /// Produced by <see cref="Microsoft.AspNetCore.Identity.PasswordHasher{TUser}"/>,
+    /// which embeds its own salt and iteration count in the stored string, so
+    /// no separate salt column is needed.
+    /// </summary>
+    public required string PasswordHash { get; set; }
+
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 
     /// <summary>

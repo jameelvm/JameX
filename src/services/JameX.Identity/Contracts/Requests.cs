@@ -15,7 +15,10 @@ namespace JameX.Identity.Contracts;
 /// ever needed inputs the HTTP body does not carry.
 /// </para>
 /// </summary>
-public sealed record CreateUserRequest(string Email, string DisplayName);
+public sealed record CreateUserRequest(string Email, string DisplayName, string Password);
+
+/// <summary>The one credential exchange in the system. A separate type from <see cref="CreateUserRequest"/> even though both carry an email and password — signup also carries a display name, and conflating "prove who you are" with "tell me who you are" invites exactly the kind of subtle field-reuse bug a login form (no display name) would trip over.</summary>
+public sealed record LoginRequest(string Email, string Password);
 
 public sealed record CreateChannelRequest(string Name, string Handle, string? AvatarUrl);
 

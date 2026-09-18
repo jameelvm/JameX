@@ -109,3 +109,35 @@ public sealed class MessagingOptions
     /// </summary>
     public int VisibilityTimeoutSeconds { get; set; } = 300;
 }
+
+/// <summary>
+/// The one shared secret Identity and the Gateway must agree on: Identity
+/// signs a token with it at login, the Gateway verifies the signature with
+/// the same value. Bound identically in both services' config (and in
+/// docker-compose's shared environment block) so a mismatch is a deployment
+/// bug, not a routine per-service setting.
+/// <para>
+/// A symmetric key, not an asymmetric keypair — this is one trust boundary
+/// (Identity and the Gateway are the only two parties that ever touch the
+/// key), so the extra machinery of separate signing/verification keys buys
+/// nothing here that it would in a system where the verifier and issuer are
+/// operated by different parties.
+/// </para>
+/// </summary>
+public sealed class JwtOptions
+{
+    public const string SectionName = "Jwt";
+
+    public string Issuer { get; set; } = "JameX.Identity";
+    public string Audience { get; set; } = "JameX";
+
+    /// <summary>
+    /// Dev-only value lives in every service's committed `appsettings.json`,
+    /// the same convention this file already uses for the LocalStack AWS
+    /// credentials — it only works against this local compose stack. A real
+    /// deployment must override it with a real secret, never commit one.
+    /// </summary>
+    public string SigningKey { get; set; } = "";
+
+    public int ExpiryMinutes { get; set; } = 60;
+}

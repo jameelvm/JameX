@@ -22,6 +22,10 @@ public sealed class IdentityDbContext(DbContextOptions<IdentityDbContext> option
 
             user.Property(u => u.Email).HasMaxLength(320).IsRequired();
             user.Property(u => u.DisplayName).HasMaxLength(100).IsRequired();
+            // PasswordHasher's output is a base64 string of a fixed-size byte
+            // buffer (versioned header + salt + subkey) — 200 gives headroom
+            // over its current length without inviting an unbounded value in.
+            user.Property(u => u.PasswordHash).HasMaxLength(200).IsRequired();
             user.Property(u => u.CreatedAt).IsRequired();
 
             // The strong-consistency guarantee, expressed as a constraint.

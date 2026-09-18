@@ -58,6 +58,16 @@ public sealed class OperationResult<T>
     public static OperationResult<T> Invalid(string field, string message) =>
         new(ResultStatus.Invalid, default, null,
             new Dictionary<string, string[]> { [field] = [message] });
+
+    /// <summary>
+    /// The caller presented credentials, and they were wrong. Distinct from
+    /// <see cref="Forbidden"/>: 401 says "I don't know who you are" (or don't
+    /// believe you), 403 says "I know exactly who you are, and it's not
+    /// enough". A login failure is always the former — there is no
+    /// "authenticated but insufficiently privileged" step in a login.
+    /// </summary>
+    public static OperationResult<T> Unauthorized(string error) =>
+        new(ResultStatus.Unauthorized, default, error, null);
 }
 
 public enum ResultStatus
@@ -66,7 +76,8 @@ public enum ResultStatus
     NotFound = 1,
     Conflict = 2,
     Invalid = 3,
-    Forbidden = 4
+    Forbidden = 4,
+    Unauthorized = 5
 }
 
 /// <summary>
@@ -92,6 +103,7 @@ public static class ActionResultExtensions
                 ? new NotFoundResult()
                 : new NotFoundObjectResult(new { error = result.Error }),
             ResultStatus.Conflict => new ConflictObjectResult(new { error = result.Error }),
+            ResultStatus.Unauthorized => new UnauthorizedObjectResult(new { error = result.Error }),
             ResultStatus.Forbidden => new ObjectResult(new { error = result.Error })
             {
                 StatusCode = StatusCodes.Status403Forbidden

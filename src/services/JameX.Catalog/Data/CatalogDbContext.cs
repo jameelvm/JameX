@@ -65,6 +65,16 @@ public sealed class CatalogDbContext(DbContextOptions<CatalogDbContext> options)
                 .HasDatabaseName("ix_videos_channel_id_created_at")
                 .IsDescending(false, true);
 
+            // "Your videos": every status and privacy level, unlike the
+            // channel-page and feed indexes above which both exclude
+            // everything but public+Ready. The uploader is always the
+            // authenticated caller themselves (see VideosController.GetMine),
+            // so there is no privacy leak in returning their own private or
+            // still-processing rows here.
+            video.HasIndex(v => new { v.UploaderId, v.CreatedAt })
+                .HasDatabaseName("ix_videos_uploader_id_created_at")
+                .IsDescending(false, true);
+
             // The public feed. Partial, because it only ever serves rows that
             // are both public and playable — which excludes every private,
             // queued, transcoding and failed video from the index entirely.

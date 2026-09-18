@@ -1,5 +1,7 @@
+using JameX.Identity.Domain;
 using JameX.Identity.Repositories;
 using JameX.Identity.Services;
+using Microsoft.AspNetCore.Identity;
 
 namespace JameX.Identity;
 
@@ -19,6 +21,11 @@ public static class IdentityRegistration
 
         services.AddScoped<IUserService, UserService>();
         services.AddScoped<IChannelService, ChannelService>();
+
+        // Stateless, so a singleton — PasswordHasher<T> carries no per-request
+        // state, and TokenService only reads immutable IOptions config.
+        services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
+        services.AddSingleton<ITokenService, TokenService>();
 
         return services;
     }

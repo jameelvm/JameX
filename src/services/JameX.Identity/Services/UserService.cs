@@ -5,6 +5,7 @@ using JameX.Identity.Mapping;
 using JameX.Identity.Repositories;
 using JameX.Identity.Validation;
 using JameX.ServiceDefaults.Application;
+using Microsoft.AspNetCore.Identity;
 
 namespace JameX.Identity.Services;
 
@@ -21,6 +22,7 @@ namespace JameX.Identity.Services;
 public interface IUserService
 {
     Task<OperationResult<UserDto>> CreateAsync(CreateUserRequest request, CancellationToken ct);
+    Task<OperationResult<AuthResponse>> LoginAsync(LoginRequest request, CancellationToken ct);
     Task<OperationResult<UserDto>> GetAsync(Guid userId, CancellationToken ct);
     Task<OperationResult<IReadOnlyList<UserDto>>> GetBatchAsync(IReadOnlyList<Guid> ids, CancellationToken ct);
     Task<OperationResult<IReadOnlyList<ChannelDto>>> GetChannelsAsync(Guid userId, CancellationToken ct);
@@ -28,7 +30,9 @@ public interface IUserService
 
 internal sealed class UserService(
     IUserRepository users,
-    IChannelRepository channels) : IUserService
+    IChannelRepository channels,
+    IPasswordHasher<User> passwordHasher,
+    ITokenService tokenService) : IUserService
 {
     public async Task<OperationResult<UserDto>> CreateAsync(
         CreateUserRequest request, CancellationToken ct)
@@ -43,7 +47,16 @@ internal sealed class UserService(
             return OperationResult<UserDto>.Invalid(
                 "displayName", "Display name must be between 1 and 100 characters.");
 
-        var user = new User { Email = email, DisplayName = displayName };
+        if (!Normalise.IsValidPassword(request.Password))
+            return OperationResult<UserDto>.Invalid(
+                "password", "Password must be at least 8 characters.");
+
+        // PasswordHasher needs a User instance to hash against (its interface
+        // is generic over TUser, in case a real ASP.NET Identity store wanted
+        // per-user hashing parameters), but never reads anything off it — the
+        // hash itself is what actually goes on the entity we save.
+        var user = new User { Email = email, DisplayName = displayName, PasswordHash = "" };
+        user.PasswordHash = passwordHasher.HashPassword(user, request.Password);
 
         // No "does this email exist?" pre-check. Two concurrent registrations
         // would both read absent and both insert; only the unique index
@@ -51,6 +64,36 @@ internal sealed class UserService(
         return await users.TryAddAsync(user, ct)
             ? OperationResult<UserDto>.Success(user.ToDto())
             : OperationResult<UserDto>.Conflict("That email address is already registered.");
+    }
+
+    /// <summary>
+    /// One deliberately vague failure message for both "no such account" and
+    /// "wrong password" — telling an attacker which one narrows their search
+    /// space for free, and a real user gets the same actionable advice
+    /// ("check your email and password") either way.
+    /// </summary>
+    public async Task<OperationResult<AuthResponse>> LoginAsync(
+        LoginRequest request, CancellationToken ct)
+    {
+        var email = Normalise.Email(request.Email);
+        var user = await users.GetByEmailAsync(email, ct);
+
+        if (user is null)
+        {
+            // Still runs a hash verification against a throwaway value even
+            // though there is no user to check against — a real lookup and a
+            // "no such email" rejection should take about the same amount of
+            // time, or the response latency itself leaks which emails exist.
+            passwordHasher.HashPassword(new User { Email = email, DisplayName = "", PasswordHash = "" }, request.Password);
+            return OperationResult<AuthResponse>.Unauthorized("Invalid email or password.");
+        }
+
+        var verification = passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+        if (verification == PasswordVerificationResult.Failed)
+            return OperationResult<AuthResponse>.Unauthorized("Invalid email or password.");
+
+        var token = tokenService.IssueToken(user.Id, user.Email);
+        return OperationResult<AuthResponse>.Success(new AuthResponse(token, user.ToDto()));
     }
 
     public async Task<OperationResult<UserDto>> GetAsync(Guid userId, CancellationToken ct)

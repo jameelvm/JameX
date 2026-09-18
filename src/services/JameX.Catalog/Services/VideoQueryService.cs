@@ -28,6 +28,9 @@ public interface IVideoQueryService
     Task<OperationResult<VideoDetail>> GetAsync(Guid videoId, CancellationToken ct);
     Task<OperationResult<PagedResult<VideoSummary>>> GetFeedAsync(int page, int pageSize, CancellationToken ct);
     Task<OperationResult<PagedResult<VideoSummary>>> GetByChannelAsync(Guid channelId, int page, int pageSize, CancellationToken ct);
+
+    /// <summary>"Your videos" — see <c>IVideoRepository.GetByUploaderAsync</c> for why this is unfiltered by status/privacy where <see cref="GetByChannelAsync"/> is not.</summary>
+    Task<OperationResult<PagedResult<VideoSummary>>> GetMineAsync(Guid callerId, int page, int pageSize, CancellationToken ct);
     Task<OperationResult<IReadOnlyList<VideoSummary>>> GetBatchAsync(IReadOnlyList<Guid> ids, CancellationToken ct);
 
     /// <summary>The Postgres FTS half of the phase 5 comparison — see <c>IVideoRepository.SearchByTitleAsync</c>.</summary>
@@ -112,6 +115,19 @@ internal sealed class VideoQueryService(
         // from "a real channel with nothing published", because channels live
         // in Identity. Claiming a 404 would be asserting something this service
         // has no way to know.
+        return OperationResult<PagedResult<VideoSummary>>.Success(
+            new PagedResult<VideoSummary>(
+                items.Select(v => v.ToSummary(_storage)).ToArray(), total, page, pageSize));
+    }
+
+    public async Task<OperationResult<PagedResult<VideoSummary>>> GetMineAsync(
+        Guid callerId, int page, int pageSize, CancellationToken ct)
+    {
+        page = CatalogRules.NormalisePage(page);
+        pageSize = CatalogRules.NormalisePageSize(pageSize);
+
+        var (items, total) = await videos.GetByUploaderAsync(callerId, page, pageSize, ct);
+
         return OperationResult<PagedResult<VideoSummary>>.Success(
             new PagedResult<VideoSummary>(
                 items.Select(v => v.ToSummary(_storage)).ToArray(), total, page, pageSize));

@@ -28,6 +28,18 @@ public sealed class UsersController(IUserService userService) : ControllerBase
             // the id the client did not choose.
             .ToActionResult(user => Created($"/users/{user.UserId}", user));
 
+    /// <summary>
+    /// The one credential exchange in the system — see <see cref="IUserService.LoginAsync"/>.
+    /// Everything downstream of this call trusts the token it returns without
+    /// asking Identity again; see the Gateway's JWT-bearer validation for the
+    /// other half of that trust.
+    /// </summary>
+    [HttpPost("login")]
+    [ProducesResponseType<AuthResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    public async Task<IActionResult> Login(LoginRequest request, CancellationToken ct) =>
+        (await userService.LoginAsync(request, ct)).ToActionResult();
+
     [HttpGet("{userId:guid}")]
     [ProducesResponseType<UserDto>(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
