@@ -56,7 +56,30 @@ request (renamed "Interview talking points"/"Interview question bank" to
 "Design talking points"/"Design Q&A bank", dropped "before an interview"
 phrasing) — the content is unchanged, only the framing, since this repo may
 be visible to colleagues.
+**Phase 8: COMPLETE — real authentication.** Identity takes a real password
+at signup (hashed with `PasswordHasher<User>`) and issues a JWT on login;
+the Gateway validates that JWT and rewrites `X-JameX-User` from its subject
+claim before proxying anywhere, **stripping any client-supplied value
+first** — closing the spoofing gap named in every earlier phase's "auth is
+stubbed" notes. Catalog gained an authorised `GET /videos/mine` (every
+status/privacy level, unlike every other list endpoint, since the caller is
+always the uploader). The frontend gained real `/login` and `/signup`
+pages, a "Your videos" tab, and lost the old silent guest-account
+auto-creation — signed-out visitors now browse anonymously by design, and
+`ViewerProvider` centralises the auth token so no call site threads a
+`viewerId` through by hand anymore. **Verified live, through the real UI,
+not just curl:** signed up a real account, saw it auto-log-in and the
+header update; liked a video and reloaded — the reaction survived (the
+JWT-cookie successor to the old raw-user-id-cookie trick); visited "Your
+videos" (server-rendered, forwarding the cookie token as a real bearer
+header) and saw the correct empty state; signed out and confirmed the
+header reverted to Sign in/Sign up, the like count was still visible, and
+the button was correctly un-highlighted and disabled for the anonymous
+viewer. Also verified at the wire level: a hand-crafted `X-JameX-User`
+header with no token is rejected (401) on an endpoint that used to trust it
+outright.
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
+`npm run lint`/`npm run build` (web/) both clean.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
 **Runnable end to end: YES.** A real video goes upload → transcoded → playable
 HLS through the CDN edge in under 20 seconds, with zero manual intervention on
@@ -844,6 +867,13 @@ Ordered. Each phase leaves the build green **and** updates `README.md`.
    concept in the five spec chapters to its implementation, its one-line
    rationale, and the decision-register entry with the full argument, plus
    a "Designed, not built" table for gaps named on purpose.
+8. ~~Real authentication~~ — done, outside the original five-chapter scope.
+   Password signup/login issuing a JWT (Identity), Gateway-side JWT
+   validation replacing client-trusted headers, an authorised
+   `GET /videos/mine` (Catalog), and real sign-in/sign-up pages plus a
+   "Your videos" tab (frontend) — see "Current state" above for the full
+   verification. README.md/DESIGN.md do not yet have a write-up for this
+   phase, since it sits outside the design doc's own five chapters.
 
 ---
 
