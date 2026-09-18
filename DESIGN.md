@@ -518,7 +518,15 @@ other cannot.
 
 ---
 
-**A cookie mirrors the viewer id specifically for server-rendered requests**
+**A cookie mirrors the viewer's identity specifically for server-rendered requests**
+
+> **Superseded by phase 8 (§3.9), mechanism kept, payload changed.** As
+> written below, the cookie held a bare, client-chosen user id, forwarded
+> as `X-JameX-User` and trusted outright — the phase 6 guest-identity stub
+> had nothing stronger to offer. Phase 8 replaces the payload with a real
+> JWT and the trust model with real signature validation; the *reason* a
+> cookie exists at all (a Server Component has no `localStorage`) is
+> unchanged, which is why this entry is annotated rather than deleted.
 
 - *Alternative:* rely on `localStorage` alone, the way the guest identity is
   otherwise persisted.
@@ -612,6 +620,137 @@ other cannot.
 
 ---
 
+### 3.9 Real authentication (phase 8 — outside the original scope)
+
+The design doc's functional requirements never included login — chapter 2
+is explicit that authentication is out of scope, and `ICurrentUser` was
+deliberately stubbed behind a plain header from phase 2 onward specifically
+*because* building real identity "would add a lot of code that teaches
+nothing about video delivery." Phase 8 builds it anyway, at the owner's
+request, once every video-delivery concept the doc actually cares about was
+already done. It is the one phase in this project with no chapter behind
+it — see §7's doc-to-code map, which doesn't attempt to place it under any
+of the five chapters for exactly that reason.
+
+---
+
+**`PasswordHasher<TUser>`, not a hand-rolled hash, and not full ASP.NET Identity**
+
+- *Alternative:* a custom PBKDF2/bcrypt call, or pulling in ASP.NET Core
+  Identity's full `UserManager`/`SignInManager`/store abstraction.
+- *Why:* `PasswordHasher<TUser>` is the one piece of that framework worth
+  taking — it embeds its own salt and iteration count in the stored string,
+  so there's no separate salt column to manage, and it needs no user store,
+  no cookie-auth middleware, and no schema beyond one `string` column to
+  use standalone. The full framework's stores and managers solve a problem
+  this project doesn't have: exactly one credential type, one identity
+  provider, no roles, no external logins.
+- *Where:* `Domain/User.cs`, `Services/UserService.cs` (Identity).
+
+---
+
+**A symmetric JWT, issued by Identity, validated only by the Gateway**
+
+- *Alternative:* validate the token independently in every service, or use
+  an asymmetric keypair.
+- *Why:* asymmetric keys exist to let a party *verify* a token without also
+  being able to *forge* one — the right shape when the issuer and the
+  verifiers are operated by different parties. Here they're the same
+  system, so a shared symmetric key costs nothing extra in trust and one
+  fewer moving part. Validating only at the Gateway, not in Identity,
+  Catalog, and Engagement independently, is the literal payoff of the
+  "authenticate once, forward a trusted identity" design this project
+  named as its target back in phase 2 — Catalog and Engagement need zero
+  code changes, because they already just read `X-JameX-User`; only what's
+  allowed to *set* that header changes.
+- *Where:* `TokenService` (Identity), `GatewayRegistrationExtensions.AddJameXJwtBearer`,
+  the header-rewrite middleware in `Program.cs` (Gateway).
+
+---
+
+**Strip the client-supplied identity header before trusting anything**
+
+- *Alternative:* leave `X-JameX-User` alone when no valid token is present,
+  and only ever *add* a value from a validated token.
+- *Why:* "only add, never strip" still lets a caller with no token at all
+  set the header directly and have it pass through untouched — the exact
+  spoofing vector this design existed to close. The Gateway's middleware
+  removes any client-supplied value unconditionally on every request,
+  *then* sets it from a validated subject claim if one exists. Verified
+  directly: a hand-crafted `X-JameX-User` header with no `Authorization`
+  token, sent straight at an endpoint that used to trust it, now 401s.
+- *Where:* the header-rewrite middleware in `JameX.Gateway/Program.cs`.
+
+---
+
+**One vague error for every login failure, deliberately**
+
+- *Alternative:* "no account with that email" vs. "incorrect password" as
+  distinct messages.
+- *Why:* telling an attacker which one failed narrows their search space
+  for free — confirming an email exists is most of the work of a
+  credential-stuffing attempt. A genuine user gets identical, still fully
+  actionable advice ("check your email and password") either way. The
+  login path also runs a real password-hash verification against a
+  throwaway value even when no account was found, so a timing difference
+  between "no such user" and "wrong password" doesn't leak the same
+  information a differently-worded message would.
+- *Where:* `UserService.LoginAsync` (Identity).
+
+---
+
+**Centralise the auth header in one place, not one per call site**
+
+- *Alternative:* keep threading a `viewerId` (now a token) through every
+  function signature in `lib/api/*-client.ts`, the way the phase 6 guest
+  stub did.
+- *Why:* every authenticated browser call already went through one of
+  three shared functions (`browserApiFetch`/`browserApiFetchOrNull`/
+  `browserApiMutate`); attaching `Authorization: Bearer` there once means
+  reactions, comments, uploads, and channel creation all drop the
+  parameter entirely instead of each rebuilding the same header. A request
+  with no signed-in viewer simply carries no `Authorization` header, and
+  whatever endpoint required one 401s correctly — anonymous browsing is
+  the default path, not a special case bolted on.
+- *Where:* `lib/api/browser-client.ts` (web).
+
+---
+
+**Anonymous browsing and a real account, not a guest account for everyone**
+
+- *Alternative:* keep phase 6's silent guest-account auto-provisioning
+  (a real Identity user created invisibly on first visit) now that real
+  accounts exist alongside it.
+- *Why:* the two solve different problems and conflating them serves
+  neither well. A visitor who never signs up leaves behind a real,
+  permanent, useless Identity row under the old design — every anonymous
+  visit was quietly an account creation. Dropping it makes "not logged in"
+  a first-class, intentional state (`viewer: null`, not a loading flicker
+  before an account materialises) and makes signing up mean something: it
+  is the first time this browser is asked to create anything at all.
+- *Where:* `ViewerProvider` (web) — no longer calls `POST /users` on mount.
+
+---
+
+**`GET /videos/mine` returns every status and privacy level, unlike every other list endpoint**
+
+- *Alternative:* reuse `GetByChannelAsync`'s existing public/Ready filter
+  and let "Your videos" show only what a stranger could already see.
+- *Why:* the entire point of a personal content list is seeing the videos
+  that *aren't* done yet — private ones, ones still transcoding, ones that
+  failed. That's safe specifically because the caller is authorised by
+  `RequireUserId()` and the query filters by that same id as
+  `Video.UploaderId` — there is no path where one account sees another's
+  unlisted rows. No cross-service ownership check was needed either:
+  Catalog already stores `UploaderId` for its existing PATCH/DELETE
+  authorisation, so this reused an existing column rather than asking
+  Identity anything.
+- *Where:* `VideosController.GetMine`, `VideoQueryService.GetMineAsync`,
+  `VideoRepository.GetByUploaderAsync`, and a new
+  `ix_videos_uploader_id_created_at` index (Catalog).
+
+---
+
 ## 4. Failure modes and what defends against them
 
 The most useful way to hold the design in your head.
@@ -651,6 +790,10 @@ The most useful way to hold the design in your head.
 | 31 | A list needs N callers' display names, mostly repeating the same few | Batch by *distinct* id, resolved in parallel, merged back by id | ✅ |
 | 32 | A resource's URL is valid on the wire but the underlying object is gone | Client-side `onError` fallback, same placeholder a null URL gets | ✅ |
 | 33 | Personalised server-rendered data has no way to know who's asking | Mirror the client identity into a cookie the server *can* read | ✅ |
+| 34 | A client sets its own identity header directly and impersonates anyone | Gateway strips it unconditionally, sets it only from a validated JWT | ✅ |
+| 35 | A login response tells an attacker whether an email is registered | One error message for both "no such user" and "wrong password" | ✅ |
+| 36 | "No such user" resolves faster than "wrong password", leaking which | Hash a throwaway value on the not-found path too, same cost either way | ✅ |
+| 37 | Every visitor silently gets a real, permanent account just by browsing | Dropped guest auto-provisioning; anonymous browsing needs no account at all | ✅ |
 
 ---
 
@@ -984,6 +1127,68 @@ just the identity, not the whole client state, into something the server
 layer already expects. It's a narrow, purpose-built bridge between two
 execution contexts, not a redesign of where identity lives.
 
+### Real authentication (phase 8)
+
+**"Your services trust an `X-JameX-User` header set by whoever calls them.
+How do you turn that into something you can actually trust?"**
+Move the point of trust to exactly one place, and make everything else
+trust *it* instead of the caller. The Gateway strips whatever identity
+header the client sent — unconditionally, on every request — then sets it
+again only from a JWT it just cryptographically validated. Every
+downstream service's code is unchanged: it still just reads the header,
+but now that header can only ever hold what a valid signature vouched for.
+The mistake to avoid is stripping only *sometimes*, or only adding a
+validated value without first removing an unvalidated one — either leaves
+the original spoofing path open for exactly the requests that have no
+token at all.
+
+**"Symmetric or asymmetric signing for your tokens?"**
+Depends on whether the issuer and the verifier are the same trust
+boundary. Asymmetric keys exist so a party can verify a signature without
+being able to *produce* one — valuable when a third party validates
+tokens they didn't issue. Here, Identity issues and only the Gateway
+verifies, both inside the same system; a shared symmetric key is simpler
+and loses nothing, since neither side needed protection from the other.
+
+**"How do you hash passwords, and why not roll your own?"**
+Never invent a KDF. Use a maintained one — here, `PasswordHasher<TUser>`
+— that embeds its own salt and cost parameter in the stored value, so
+there's no separate salt column to manage and no home-grown iteration
+count to eventually get wrong. It's also worth knowing what you *didn't*
+pull in: the full ASP.NET Identity framework's user store and sign-in
+manager solve multi-provider, multi-role problems this system doesn't
+have; taking only the hasher avoids a dependency shaped for a much bigger
+problem.
+
+**"A login fails. What should the error message say?"**
+The same thing, whether the email doesn't exist or the password is wrong.
+Distinguishing them for the caller's convenience is exactly what confirms
+to an attacker which emails are registered, for free. Match that on
+timing too: hash a throwaway value even on the "no such user" path, or the
+faster response time for a nonexistent email becomes the same leak in a
+different form.
+
+**"Every call to your API needs to know who's calling. Where does that
+identity get attached — in each function, or somewhere central?"**
+Wherever every one of those calls already funnels through. If there's a
+shared low-level client (here, three thin wrappers every browser-side API
+call goes through), attaching the credential there once means every
+higher-level call — react, comment, upload, create a channel — never
+touches the concept at all. The alternative is re-deriving "how do I prove
+who I am" at every call site, which is both more code and more places for
+one of them to get it wrong.
+
+**"Should an anonymous visitor get an invisible account created for them,
+or should 'not logged in' just be a real, supported state?"**
+The latter, once real accounts exist. An auto-provisioned guest account
+solves "I need *some* identity to authorise a write against" — which
+stops being a real problem the moment users can sign up for their own.
+Keeping auto-provisioning around after that just means every anonymous
+page view is quietly minting a permanent, empty database row. Treating
+"no viewer" as a first-class value your UI branches on (browse freely,
+prompt to sign in for anything that writes) is both fewer moving parts and
+a more honest account of what's actually happening.
+
 ### Implementation-level
 
 **"Do you use the repository pattern with EF Core?"**
@@ -1029,7 +1234,8 @@ repository and domain layers did not change by a line — which is the real poin
 | Reverse-proxy header ownership (CORS at a CDN boundary) | Good | ✅ found and fixed a real duplicate-header bug a browser-only enforces |
 | CDN tiering by popularity | Designed | ⬜ phase 5–6 |
 | Database sharding, Vitess | Reading only | ⬜ not planned |
-| Auth, rate limiting, recommendations | Out of scope | ⬜ |
+| Authentication: password storage, JWT issuance and validation | **Strong** | ✅ phase 8 (outside the design doc's own scope) — verified: spoofed identity header rejected, real token accepted, timing-safe login failure |
+| Rate limiting, recommendations | Out of scope | ⬜ |
 
 **The honest framing:** phase 3 was not about video. It was about making an
 event-driven system *correct* — which is the part most candidates get wrong. If
@@ -1103,7 +1309,21 @@ purpose is different from not knowing it exists.
 | Per-shot (per-segment) encoding | 5 | A genuine stretch goal — the fixed ABR ladder already demonstrates adaptive streaming end to end |
 | Duplicate detection via perceptual hashing / LSH | 5 | Out of scope — no content-similarity requirement in this build's six functional requirements |
 | Recommendations (candidate generation + ranking) | 5 | Explicitly out of scope from the start (README §1) — a genuinely different system, not an extension of this one |
-| Auth, rate limiting | 2, 4 | Named as stubbed from phase 2 onward (`ICurrentUser` is a header, not real auth) — a production Gateway would authenticate once and forward a signed identity |
+| Rate limiting | 2, 4 | Named as a gap even after phase 8 built real login — nothing yet throttles repeated login attempts or per-account request volume |
+
+**Beyond the five chapters** — built anyway, at the owner's request, once
+every video-delivery concept the doc itself cares about was done (§3.9 has
+the full argument for each):
+
+| Concept | Where | Full argument |
+|---|---|---|
+| Password hashing with an embedded salt, no separate salt column | `Domain/User.cs`, `Services/UserService.cs` (Identity) | §3.9 |
+| A symmetric JWT, issued once, validated only at the Gateway | `TokenService` (Identity), `AddJameXJwtBearer` + header-rewrite middleware (Gateway) | §3.9 |
+| Stripping a client-supplied identity header before trusting anything | Header-rewrite middleware, `JameX.Gateway/Program.cs` | §3.9 |
+| One indistinguishable error, and equal timing, for every login failure | `UserService.LoginAsync` (Identity) | §3.9 |
+| One place a browser call attaches its credential, not one per call site | `lib/api/browser-client.ts` (web) | §3.9 |
+| Anonymous browsing as a real state, not an invisible auto-created account | `ViewerProvider` (web) | §3.9 |
+| An authorised, privacy-blind-to-self video listing ("Your videos") | `VideosController.GetMine` and friends (Catalog) | §3.9 |
 
 ---
 
@@ -1120,6 +1340,7 @@ purpose is different from not knowing it exists.
 | **Fan-out** | One published message delivered to many independent consumers |
 | **Idempotent** | Applying it twice has the same effect as applying it once |
 | **Inbox pattern** | Recording handled event ids in the same transaction as the change, to reject duplicates |
+| **JWT** | JSON Web Token — a signed, self-contained credential; here, the Gateway validates the signature and trusts whatever subject claim it carries |
 | **LRU** | Least-recently-used — evict whatever has gone untouched the longest |
 | **Long tail** | Most items get very few requests; a few get almost all of them |
 | **N+1** | One query for a list, then one more per item — ruinous when each is a network call |

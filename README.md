@@ -10,10 +10,12 @@ component that document describes has a real, runnable counterpart here.
 **Stack:** .NET 10 · PostgreSQL · DynamoDB · S3 · SQS · SNS · Redis · FFmpeg ·
 YARP · Next.js · Docker Compose + LocalStack
 
-**Build status:** phases 1–6 complete and verified. The whole pipeline runs
-end to end, in a real browser: presigned resumable upload → FFmpeg ABR
-ladder → Catalog → CDN → hls.js playback, with live reactions, comments, a
-real home feed, and search. A real video goes from upload to playable HLS in
+**Build status:** phases 1–8 complete and verified (phase 8, real
+authentication, sits outside the design doc's own scope — see §12). The
+whole pipeline runs end to end, in a real browser: sign up, presigned
+resumable upload → FFmpeg ABR ladder → Catalog → CDN → hls.js playback,
+with live reactions, comments, a real home feed, and search. A real video
+goes from upload to playable HLS in
 under 20 seconds.
 
 ---
@@ -31,9 +33,10 @@ under 20 seconds.
 9. [Phase 4 — Ingest and Encoder](#9-phase-4--ingest-and-encoder)
 10. [Phase 5 — Engagement and Search](#10-phase-5--engagement-and-search)
 11. [Phase 6 — Gateway and frontend](#11-phase-6--gateway-and-frontend)
-12. [Verification](#12-verification)
-13. [Design talking points](#13-design-talking-points)
-14. [Roadmap](#14-roadmap)
+12. [Phase 8 — Real authentication](#12-phase-8--real-authentication)
+13. [Verification](#13-verification)
+14. [Design talking points](#14-design-talking-points)
+15. [Roadmap](#15-roadmap)
 
 ---
 
@@ -367,6 +370,31 @@ table exists before any service starts.
 ```bash
 dotnet build JameX.slnx
 ```
+
+### Run the frontend
+
+The backend stack above is enough to drive the API directly (curl, Scalar,
+the debug harness at `:3100`), but the real Next.js app is a separate
+process — `docker compose` does not start it.
+
+```bash
+cd web
+npm install                        # first time only
+cp .env.local.example .env.local   # first time only
+npm run dev
+```
+
+Open `http://localhost:3000`. Browsing (the home feed, search, watch pages)
+works immediately with no account. Reacting, commenting, and uploading need
+a real one — use **Sign up** in the header once, then **Sign in** on later
+visits; see §12 for how that's actually built.
+
+### Debugging in Visual Studio
+
+Every service can run under the debugger *alongside* its own container —
+stop the container, press F5, and the Gateway starts routing to your
+debugger within a few seconds, with nothing to reconfigure and nothing to
+switch back afterwards. Full guide: **[`DEBUGGING.md`](DEBUGGING.md)**.
 
 ### Ports
 
@@ -2033,7 +2061,136 @@ and the other looking intentional.
 
 ---
 
-## 12. Verification
+## 12. Phase 8 — Real authentication
+
+Every phase so far maps onto one of the design doc's five chapters — see
+§7 of [`DESIGN.md`](DESIGN.md) for the literal table. This one doesn't, on
+purpose: chapter 2 explicitly puts authentication out of scope, and
+`ICurrentUser` was stubbed behind a plain header from phase 2 onward
+specifically *because* real identity "would add a lot of code that teaches
+nothing about video delivery." Once every video-delivery concept the doc
+actually cares about was built, real auth was the next thing worth doing
+properly rather than pretending a guest-account stub was good enough
+forever.
+
+### 12.1 What exists now
+
+| | Identity (additions) | Gateway (additions) | Catalog (addition) | Frontend |
+|---|---|---|---|---|
+| New surface | `POST /users` now takes a password; `POST /users/login` | JWT-bearer validation + a header-rewrite middleware | `GET /videos/mine` | `/login`, `/signup`, `/you` |
+| Stores | `users.password_hash` (new column) | — (validates, doesn't store) | — (reuses `Video.UploaderId`) | a token, not a raw user id |
+| Removed | — | — | — | silent guest-account auto-creation |
+
+### 12.2 Password storage and the login endpoint
+
+`User.PasswordHash` is the only new column — `PasswordHasher<User>`
+(ASP.NET Core's standalone hasher class, not the full Identity framework
+with its user stores and sign-in managers this project has no use for)
+embeds its own salt and cost parameter in the stored string, so there's no
+separate salt column and no home-grown iteration count to eventually get
+wrong. `POST /users/login` looks the account up by email, verifies the
+hash, and — on success — asks a new `TokenService` for a signed JWT.
+
+**One deliberate non-feature:** login returns exactly one error message,
+`"Invalid email or password."`, whether the email doesn't exist or the
+password is wrong — and it runs a real hash verification against a
+throwaway value even on the not-found path, so the two cases also take
+the same amount of time. Distinguishing them, in either the message or the
+timing, is free reconnaissance for anyone trying to enumerate registered
+emails.
+
+### 12.3 The Gateway becomes the one place that validates anything
+
+This is the payoff of a sentence that has sat in `JameX.Gateway/Program.cs`
+since phase 2, unimplemented, as a comment about what a real Gateway would
+eventually do: *"The Gateway validates the caller once and forwards a
+trusted identity, so seven services do not each re-implement token
+validation."* Phase 8 makes it true. `AddJameXJwtBearer` wires up
+ASP.NET's JWT-bearer authentication against a signing key Identity and the
+Gateway share (`Jwt:SigningKey`, identical in both services' config); a
+small middleware right after `UseAuthentication()` does the actual work:
+
+```csharp
+context.Request.Headers.Remove(HeaderCurrentUser.HeaderName);   // never trust the client's own claim
+
+var subject = context.User.FindFirst(JwtRegisteredClaimNames.Sub)?.Value;
+if (subject is not null)
+    context.Request.Headers[HeaderCurrentUser.HeaderName] = subject;  // only ever set from a validated signature
+```
+
+**Why the removal has to happen unconditionally, not just "when there's no
+valid token":** stripping only in the failure case still lets a caller
+with *no* token at all set `X-JameX-User` directly and have it pass
+through untouched — which is exactly how every service in this project
+worked before this phase. Every downstream service's own code is
+unchanged: Catalog, Engagement, and Identity itself still just read
+`X-JameX-User` via the same `HeaderCurrentUser` from phase 2. Only what's
+*allowed to set it* changed.
+
+**Verified directly, not assumed:** a hand-crafted `X-JameX-User` header
+with no `Authorization` token, sent straight at `POST /channels` (an
+endpoint that used to trust it outright), now gets a 401. The identical
+call with a real bearer token succeeds, and the channel's `ownerUserId` is
+the token's own subject — never something the request body or a spoofed
+header could choose.
+
+### 12.4 "Your videos" — one new endpoint, no new cross-service coupling
+
+`GET /videos/mine` is the one list endpoint in Catalog that returns every
+status and privacy level instead of filtering to public-and-Ready, because
+it's the one list endpoint where the caller and the uploader are always
+the same person — authorised by `RequireUserId()`, filtered by that exact
+id against `Video.UploaderId`. That column already existed for PATCH/
+DELETE's ownership check, and a new composite index
+(`ix_videos_uploader_id_created_at`, the same shape as the existing
+channel-page index) is the only schema change it needed. No call to
+Identity required: unlike the long-standing "Catalog can't verify channel
+ownership" gap noted since phase 3, this endpoint was never trying to
+verify *channel* ownership — uploader identity was always Catalog's own
+data.
+
+### 12.5 The frontend: one place to attach a credential, one real "signed out" state
+
+Every authenticated browser call already funnelled through three shared
+functions (`browserApiFetch`/`browserApiFetchOrNull`/`browserApiMutate`).
+Attaching `Authorization: Bearer <token>` there once meant every call site
+above them — reactions, comments, uploads, channel creation — could drop
+the `viewerId` parameter it used to thread through by hand entirely. A
+request from a signed-out browser simply carries no `Authorization` header
+at all, and whatever endpoint required one 401s correctly; there is
+nothing else to special-case.
+
+The bigger change is what got *removed*. `ViewerProvider` no longer calls
+`POST /users` on first visit to mint an invisible guest account — every
+anonymous page view used to be a silent, permanent Identity row. Now
+`viewer: null` is a real, intentional, browsable state: the home feed,
+search, and watch pages all work with no account at all, and only
+reacting, commenting, and uploading ask for a real sign-in. Real `/login`
+and `/signup` pages replace the old auto-provisioning, and the watch
+page's server-side personalisation (§11.3) now forwards a real
+`Authorization: Bearer` header — built from a token mirrored into a
+cookie, the same mechanism as before, just carrying a real credential
+instead of a bare, spoofable user id.
+
+### 12.6 What phase 8 does not do
+
+- **No rate limiting on login attempts.** Nothing throttles repeated
+  guesses against one account — a real deployment needs this before
+  anything else in this list.
+- **No email verification, no password reset.** Signup trusts whatever
+  email is given; there is no flow for proving ownership of it or for
+  recovering a forgotten password.
+- **No refresh tokens, no revocation.** A token is valid for its full
+  lifetime (`Jwt:ExpiryMinutes`) with no way to invalidate it early — a
+  compromised token or a "log out everywhere" action can't actually end a
+  session before it expires on its own.
+- **No OAuth / social login, no multi-factor authentication.** One
+  credential type, matching the doc's own framing that real identity was
+  never the point of this project — see the opening of this section.
+
+---
+
+## 13. Verification
 
 Everything below was run and passed on 2026-08-07.
 
@@ -2404,9 +2561,62 @@ home feed + search    responsive grid from real GET /videos and GET /search; a v
                       not a broken-image icon, after VideoThumbnail's onError fallback
 ```
 
+```bash
+# --- Phase 8: signup, login, and the spoofing gap it closes ---------------
+curl -s -X POST "http://localhost:8080/api/users" -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","displayName":"Alice","password":"correct horse battery"}'
+# → 201, real UserDto — no token, this is registration, not login
+
+curl -s -X POST "http://localhost:8080/api/users/login" -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"wrong password"}'
+# → 401 {"error":"Invalid email or password."}
+
+TOKEN=$(curl -s -X POST "http://localhost:8080/api/users/login" -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"correct horse battery"}' | jq -r .token)
+
+USERID="<alice's real id, from the signup response>"
+
+# The header used to be trusted outright. Prove it no longer is:
+curl -s -X POST "http://localhost:8080/api/channels" -H "Content-Type: application/json" \
+  -H "X-JameX-User: $USERID" -d '{"name":"Spoofed channel","handle":"spoofed"}'
+# → 401 — the Gateway strips a client-supplied X-JameX-User unconditionally
+
+curl -s -X POST "http://localhost:8080/api/channels" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -d '{"name":"Alice channel","handle":"alicechannel"}'
+# → 201, ownerUserId is the token's own subject — never something the caller chose
+
+curl -s "http://localhost:8080/api/videos/mine" -H "Authorization: Bearer $TOKEN"
+# → 200, paged, every status/privacy level — this account's own uploads only
+
+curl -s "http://localhost:8080/api/videos?page=1&pageSize=1"
+# → 200, no Authorization header at all — anonymous browsing is unaffected
+```
+
+**Verified, 2026-09-17:**
+
+```
+signup + login        real account created, hashed password stored; wrong password → 401
+                       with a generic message; correct password → a real JWT
+spoofing closed        a hand-crafted X-JameX-User header with no token, sent at an
+                       endpoint that used to trust it outright, now 401s; the identical
+                       call with a real bearer token succeeds as that token's own subject
+GET /videos/mine       401 with no token; 200 with one, scoped correctly to the caller
+anonymous browsing     the public feed, search, and watch pages all still work with
+                       zero Authorization header — unaffected by any of the above
+frontend, live in a real browser:
+  signed up             real account created, auto-signed-in, header updated live
+  reload persistence    liked a video, reloaded — the reaction survived (JWT-cookie
+                         successor to the old raw-user-id-cookie trick from phase 6)
+  "Your videos"         server-rendered, forwarding the cookie token as a real bearer
+                         header; correct empty state for a brand-new account
+  sign out              header reverted to Sign in/Sign up; the like count stayed
+                         visible but the button was correctly un-highlighted and
+                         disabled for the now-anonymous viewer
+```
+
 ---
 
-## 13. Design talking points
+## 14. Design talking points
 
 A quick-reference pass. Each is answerable from what is actually built.
 
@@ -2685,9 +2895,39 @@ workaround; it's the general lesson — "non-fatal" and "will recover
 unattended" are two different claims, and treating them as the same one is
 exactly how a transient blip becomes a permanent, silent failure.
 
+**"Every service trusts a header a caller sets. How do you make that
+trustworthy without changing every service?"**
+Move validation to one boundary everything already passes through, and
+make that boundary the *only* thing allowed to set the header downstream
+services read. The Gateway strips whatever identity header the client
+sent — unconditionally, on every request, not just when it's obviously
+wrong — then sets it again only from a signature it just validated.
+Catalog, Engagement, and Identity itself never change: they still just
+read the header, but now it can only ever hold what a real credential
+vouched for. The mistake that leaves the hole half-closed is stripping
+*conditionally* — removing it only when a token is invalid still lets a
+caller with no token at all sail through untouched.
+
+**"Symmetric or asymmetric signing for a JWT?"**
+Whichever matches your actual trust boundary. Asymmetric keys let a party
+verify a signature without being able to produce one — worth it when the
+issuer and the verifiers are different parties. When they're the same
+system, as here (one service issues, one service verifies, both internal),
+a shared symmetric key costs nothing extra in security and is one fewer
+moving part.
+
+**"How do you hash a password without rolling your own crypto?"**
+Use a maintained primitive, not a maintained framework, unless you need
+the framework. `PasswordHasher<TUser>` embeds its own salt and cost
+parameter in the stored value — no separate salt column, no home-grown
+iteration count. The full identity-framework it comes from also offers
+user stores, sign-in managers, and multi-provider login; none of that
+applies to one email/password pair per account, so none of it got pulled
+in.
+
 ---
 
-## 14. Roadmap
+## 15. Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -2697,7 +2937,8 @@ exactly how a transient blip becomes a permanent, silent failure.
 | **4** | Ingest + Encoder: resumable multipart upload, FFmpeg ABR ladder, thumbnails | ✅ **Done, verified** |
 | **5** | Engagement + Search: sharded counters, idempotent reactions, comments, DynamoDB inverted index, Postgres trigram FTS comparison | ✅ **Done, verified** |
 | **6** | Gateway BFF aggregation, Next.js frontend, hls.js adaptive player, resumable upload UI, home feed, search | ✅ **Done, verified** |
-| 7 | `DESIGN.md` — doc-to-code mapping and design Q&A | ⬜ Next |
+| **7** | `DESIGN.md` — doc-to-code mapping and design Q&A | ✅ **Done** |
+| **8** | Real authentication (outside the design doc's own scope): password login, JWT, Gateway-only validation, "Your videos" | ✅ **Done, verified** |
 
 Stretch goals once the pipeline is end to end: per-shot encoding (chapter 5),
 duplicate detection via perceptual hashing / LSH (chapter 4), optimistic

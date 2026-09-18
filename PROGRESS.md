@@ -77,7 +77,12 @@ header reverted to Sign in/Sign up, the like count was still visible, and
 the button was correctly un-highlighted and disabled for the anonymous
 viewer. Also verified at the wire level: a hand-crafted `X-JameX-User`
 header with no token is rejected (401) on an endpoint that used to trust it
-outright.
+outright. **Written up in full**: `README.md` §12 (a new phase section,
+explicitly framed as outside the design doc's own five chapters) and
+`DESIGN.md` §3.9 (six new decision-register entries), four new failure-mode
+rows, a "Real authentication" Q&A section, an updated coverage map, and a
+"Beyond the five chapters" table in §7's doc-to-code map — plus the phase 6
+cookie entry in §3.8 annotated as superseded rather than silently rewritten.
 **Build:** `dotnet build JameX.slnx` succeeds, 0 warnings, 0 errors.
 `npm run lint`/`npm run build` (web/) both clean.
 **Stack:** 11 containers run; all 7 services healthy; event bus verified.
@@ -872,8 +877,7 @@ Ordered. Each phase leaves the build green **and** updates `README.md`.
    validation replacing client-trusted headers, an authorised
    `GET /videos/mine` (Catalog), and real sign-in/sign-up pages plus a
    "Your videos" tab (frontend) — see "Current state" above for the full
-   verification. README.md/DESIGN.md do not yet have a write-up for this
-   phase, since it sits outside the design doc's own five chapters.
+   verification. `README.md` §12 and `DESIGN.md` §3.9 written and current.
 
 ---
 
