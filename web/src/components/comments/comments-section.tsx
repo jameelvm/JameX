@@ -54,14 +54,14 @@ export function CommentsSection({
   async function handlePostComment(text: string) {
     if (!viewer) return;
 
-    const created = await postComment(videoId, viewer.userId, text);
+    const created = await postComment(videoId, text);
     setComments((current) => [created, ...current]);
   }
 
   async function handleEdit(commentId: string, text: string) {
     if (!viewer) return;
 
-    const updated = await updateComment(videoId, commentId, viewer.userId, text);
+    const updated = await updateComment(videoId, commentId, text);
     setComments((current) =>
       current.map((comment) =>
         comment.commentId === commentId ? updated : comment,
@@ -72,7 +72,7 @@ export function CommentsSection({
   async function handleDelete(commentId: string) {
     if (!viewer) return;
 
-    await deleteComment(videoId, commentId, viewer.userId);
+    await deleteComment(videoId, commentId);
     setComments((current) =>
       current.map((comment) =>
         comment.commentId === commentId
@@ -102,7 +102,7 @@ export function CommentsSection({
         placeholder="Add a comment…"
         submitLabel="Comment"
         disabled={viewer === null}
-        disabledReason="Signing you in…"
+        disabledReason="Sign in to comment"
         onSubmit={handlePostComment}
       />
 

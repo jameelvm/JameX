@@ -58,7 +58,7 @@ export function ReplyThread({ videoId, parentCommentId }: ReplyThreadProps) {
   async function handlePostReply(text: string) {
     if (!viewer) return;
 
-    const created = await postComment(videoId, viewer.userId, text, parentCommentId);
+    const created = await postComment(videoId, text, parentCommentId);
     setIsExpanded(true);
     setReplies((current) => [...(current ?? []), created]);
     setIsReplying(false);
@@ -67,7 +67,7 @@ export function ReplyThread({ videoId, parentCommentId }: ReplyThreadProps) {
   async function handleEdit(commentId: string, text: string) {
     if (!viewer) return;
 
-    const updated = await updateComment(videoId, commentId, viewer.userId, text);
+    const updated = await updateComment(videoId, commentId, text);
     setReplies((current) =>
       current?.map((reply) => (reply.commentId === commentId ? updated : reply)) ?? null,
     );
@@ -76,7 +76,7 @@ export function ReplyThread({ videoId, parentCommentId }: ReplyThreadProps) {
   async function handleDelete(commentId: string) {
     if (!viewer) return;
 
-    await deleteComment(videoId, commentId, viewer.userId);
+    await deleteComment(videoId, commentId);
     setReplies((current) =>
       current?.map((reply) =>
         reply.commentId === commentId ? { ...reply, isDeleted: true } : reply,
@@ -110,7 +110,7 @@ export function ReplyThread({ videoId, parentCommentId }: ReplyThreadProps) {
           placeholder="Add a reply…"
           submitLabel="Reply"
           disabled={viewer === null}
-          disabledReason="Signing you in…"
+          disabledReason="Sign in to reply"
           autoFocus
           onCancel={() => setIsReplying(false)}
           onSubmit={handlePostReply}

@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { getComments } from "@/lib/api/comments";
 import { getWatchPage } from "@/lib/api/watch";
 import { formatPublishedDate } from "@/lib/format";
-import { getServerViewerId } from "@/lib/viewer/server-viewer";
+import { getServerAuthToken } from "@/lib/viewer/server-viewer";
 import { ChannelByline } from "@/components/video/channel-byline";
 import { CommentsSection } from "@/components/comments/comments-section";
 import { ProcessingNotice } from "@/components/video/processing-notice";
@@ -22,20 +22,20 @@ export async function generateMetadata({
   params,
 }: WatchPageProps): Promise<Metadata> {
   const { videoId } = await params;
-  const viewerId = await getServerViewerId();
-  const video = await getWatchPage(videoId, viewerId);
+  const authToken = await getServerAuthToken();
+  const video = await getWatchPage(videoId, authToken);
 
   return { title: video ? video.title : "Video not found" };
 }
 
 export default async function WatchPage({ params }: WatchPageProps) {
   const { videoId } = await params;
-  const viewerId = await getServerViewerId();
+  const authToken = await getServerAuthToken();
 
   // Independent reads — fetched together rather than one after another, the
   // same reasoning as the Gateway's own fan-out for this same page.
   const [video, comments] = await Promise.all([
-    getWatchPage(videoId, viewerId),
+    getWatchPage(videoId, authToken),
     getComments(videoId),
   ]);
 

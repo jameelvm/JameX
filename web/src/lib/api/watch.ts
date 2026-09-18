@@ -1,7 +1,6 @@
 import { cache } from "react";
 
 import { apiFetchOrNull } from "@/lib/api/client";
-import { VIEWER_HEADER_NAME } from "@/lib/api/headers";
 import type { VideoDetail } from "@/types/video";
 
 /**
@@ -9,13 +8,18 @@ import type { VideoDetail } from "@/types/video";
  * on the Gateway. `null` means the video does not exist (or was deleted);
  * that is a real, expected outcome here, not a fault.
  *
- * `viewerId` — from `getServerViewerId()`, the id-cookie mirror of the
- * client-side viewer — is forwarded as `X-JameX-User` so the Gateway can
- * resolve `viewerReaction` server-side, the same way it would for a real
- * authenticated session. Without it, every server-rendered load looks
- * anonymous and the caller's own reaction never shows as active until some
- * client-side re-fetch fixes it up after the fact — found by actually
- * clicking a reaction and reloading, not assumed.
+ * `authToken` — from `getServerAuthToken()`, the cookie mirror of the
+ * client-side session — is forwarded as a real `Authorization: Bearer`
+ * header so the Gateway can validate it and resolve `viewerReaction`
+ * server-side. This used to forward a bare, client-claimed user id as
+ * `X-JameX-User` directly; the Gateway now strips that header outright and
+ * only ever sets it from a validated token's own subject claim (see
+ * `GatewayRegistrationExtensions.AddJameXJwtBearer`), so a server-rendered
+ * request has to present the real credential to be recognised at all.
+ * Without it, every server-rendered load looks anonymous and the caller's
+ * own reaction never shows as active until some client-side re-fetch fixes
+ * it up after the fact — found by actually clicking a reaction and
+ * reloading, not assumed.
  *
  * Wrapped in React's `cache()` so `generateMetadata` and the page component
  * — which both need this video, for the same viewer — share one fetch per
@@ -24,11 +28,11 @@ import type { VideoDetail } from "@/types/video";
  * requests.
  */
 export const getWatchPage = cache(
-  (videoId: string, viewerId?: string): Promise<VideoDetail | null> =>
+  (videoId: string, authToken?: string): Promise<VideoDetail | null> =>
     apiFetchOrNull<VideoDetail>(`/watch/${videoId}`, {
       // The watch page is never static — views and reactions change on
       // every request, and this is a metadata service, not a CDN-cached asset.
       cache: "no-store",
-      headers: viewerId ? { [VIEWER_HEADER_NAME]: viewerId } : undefined,
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
     }),
 );

@@ -1,11 +1,18 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 import { useViewer } from "@/components/viewer/viewer-provider";
 
 export function SiteHeader() {
-  const { viewer, isLoading, error, resetViewer } = useViewer();
+  const router = useRouter();
+  const { viewer, isLoading, logout } = useViewer();
+
+  function handleSignOut() {
+    logout();
+    router.push("/");
+  }
 
   return (
     <header className="sticky top-0 z-10 flex items-center gap-4 border-b border-neutral-200 bg-white px-4 py-2.5 sm:px-6">
@@ -37,26 +44,52 @@ export function SiteHeader() {
         </button>
       </form>
 
-      <div className="flex shrink-0 items-center gap-4 text-sm text-neutral-700">
-        <Link
-          href="/upload"
-          className="rounded-full px-3 py-1.5 font-medium hover:bg-neutral-100"
-        >
-          Upload
-        </Link>
-        {isLoading && <span className="text-neutral-500">Signing in…</span>}
-        {!isLoading && Boolean(error) && (
-          <span className="text-neutral-500">Couldn&apos;t sign in</span>
-        )}
+      <div className="flex shrink-0 items-center gap-2 text-sm text-neutral-700 sm:gap-4">
+        {/* Reserves the row's height while the initial localStorage check
+            runs, so the header doesn't visibly pop from empty to populated
+            a moment after paint. */}
+        {isLoading && <span className="h-8 w-8" aria-hidden />}
+
         {!isLoading && viewer && (
-          <button
-            type="button"
-            onClick={resetViewer}
-            title="Switch to a new guest identity"
-            className="rounded-full px-3 py-1.5 font-medium hover:bg-neutral-100"
-          >
-            {viewer.displayName}
-          </button>
+          <>
+            <Link
+              href="/you"
+              className="rounded-full px-3 py-1.5 font-medium hover:bg-neutral-100"
+            >
+              Your videos
+            </Link>
+            <Link
+              href="/upload"
+              className="rounded-full px-3 py-1.5 font-medium hover:bg-neutral-100"
+            >
+              Upload
+            </Link>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              title={`Signed in as ${viewer.displayName} — sign out`}
+              className="rounded-full px-3 py-1.5 font-medium hover:bg-neutral-100"
+            >
+              {viewer.displayName}
+            </button>
+          </>
+        )}
+
+        {!isLoading && !viewer && (
+          <>
+            <Link
+              href="/login"
+              className="rounded-full px-3 py-1.5 font-medium hover:bg-neutral-100"
+            >
+              Sign in
+            </Link>
+            <Link
+              href="/signup"
+              className="rounded-full bg-blue-600 px-3 py-1.5 font-medium text-white hover:bg-blue-700"
+            >
+              Sign up
+            </Link>
+          </>
         )}
       </div>
     </header>

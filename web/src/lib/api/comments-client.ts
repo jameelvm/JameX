@@ -1,5 +1,4 @@
 import { browserApiFetch, browserApiMutate } from "@/lib/api/browser-client";
-import { VIEWER_HEADER_NAME } from "@/lib/api/headers";
 import type { Comment } from "@/types/comment";
 import type { PagedResult } from "@/types/api";
 
@@ -34,20 +33,18 @@ export function getReplies(
 
 /**
  * Posts a comment, or a reply when `parentCommentId` is set — same endpoint,
- * same as the backend's own `CreateCommentRequest` shape.
+ * same as the backend's own `CreateCommentRequest` shape. The caller is
+ * identified by the signed-in viewer's token, attached automatically — see
+ * `lib/api/browser-client.ts`.
  */
 export function postComment(
   videoId: string,
-  viewerId: string,
   text: string,
   parentCommentId?: string,
 ): Promise<Comment> {
   return browserApiFetch<Comment>(`/videos/${videoId}/comments`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      [VIEWER_HEADER_NAME]: viewerId,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, parentCommentId: parentCommentId ?? null }),
   });
 }
@@ -56,17 +53,13 @@ export function postComment(
 export function updateComment(
   videoId: string,
   commentId: string,
-  viewerId: string,
   text: string,
 ): Promise<Comment> {
   return browserApiFetch<Comment>(
     `/videos/${videoId}/comments/${commentId}`,
     {
       method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        [VIEWER_HEADER_NAME]: viewerId,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     },
   );
@@ -80,13 +73,8 @@ export function updateComment(
  * than "remove from the list" — the one behaviour that is correct for both
  * outcomes without a follow-up fetch.
  */
-export function deleteComment(
-  videoId: string,
-  commentId: string,
-  viewerId: string,
-): Promise<void> {
+export function deleteComment(videoId: string, commentId: string): Promise<void> {
   return browserApiMutate(`/videos/${videoId}/comments/${commentId}`, {
     method: "DELETE",
-    headers: { [VIEWER_HEADER_NAME]: viewerId },
   });
 }

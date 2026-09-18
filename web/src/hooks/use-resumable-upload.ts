@@ -64,7 +64,6 @@ const IDLE_STATE: UploadState = {
 /** In-flight session details, held outside React state deliberately — see the hook's own remarks. */
 interface ActiveSession {
   uploadId: string;
-  viewerId: string;
   partSizeBytes: number;
   totalParts: number;
   file: File;
@@ -104,7 +103,7 @@ export function useResumableUpload() {
 
   const finishUpload = useCallback(async (session: ActiveSession) => {
     setState((current) => ({ ...current, phase: "completing" }));
-    await completeUpload(session.uploadId, session.viewerId);
+    await completeUpload(session.uploadId);
     clearPersistedSession();
     setPersistedSession(null);
     setState((current) => ({ ...current, phase: "done" }));
@@ -119,7 +118,7 @@ export function useResumableUpload() {
     // The client never assumes what already landed — it asks. This one call
     // is what makes both "resume after a pause" and "resume after a reload"
     // the same code path as a fresh upload.
-    const status = await getUploadStatus(session.uploadId, session.viewerId);
+    const status = await getUploadStatus(session.uploadId);
     const alreadyUploaded = new Set(status.uploadedPartNumbers);
 
     setState((current) => {
@@ -140,7 +139,7 @@ export function useResumableUpload() {
       return;
     }
 
-    const presigned = await presignParts(session.uploadId, session.viewerId, missing);
+    const presigned = await presignParts(session.uploadId, missing);
     const urlByPart = new Map(presigned.map((part) => [part.partNumber, part.url]));
 
     const queue = [...missing];
@@ -167,7 +166,7 @@ export function useResumableUpload() {
         const eTag = putResponse.headers.get("ETag");
         if (!eTag) throw new Error("ETag not readable from the S3 response.");
 
-        await reportPart(session.uploadId, session.viewerId, partNumber, eTag);
+        await reportPart(session.uploadId, partNumber, eTag);
 
         setPartState(partNumber, "done");
         setState((current) => ({ ...current, uploadedCount: current.uploadedCount + 1 }));
@@ -238,11 +237,10 @@ export function useResumableUpload() {
           sizeBytes: file.size,
         };
 
-        const created = await beginUpload(viewer.userId, request);
+        const created = await beginUpload(request);
 
         sessionRef.current = {
           uploadId: created.uploadId,
-          viewerId: viewer.userId,
           partSizeBytes: created.partSizeBytes,
           totalParts: created.totalParts,
           file,
@@ -284,7 +282,6 @@ export function useResumableUpload() {
       pausedRef.current = false;
       sessionRef.current = {
         uploadId: persistedSession.uploadId,
-        viewerId: viewer.userId,
         partSizeBytes: persistedSession.partSizeBytes,
         totalParts: persistedSession.totalParts,
         file,
@@ -320,7 +317,7 @@ export function useResumableUpload() {
 
     pausedRef.current = true;
     try {
-      await abortUpload(session.uploadId, session.viewerId);
+      await abortUpload(session.uploadId);
     } finally {
       sessionRef.current = null;
       clearPersistedSession();

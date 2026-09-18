@@ -1,4 +1,5 @@
 import { VideoCard } from "@/components/video/video-card";
+import type { VideoStatus } from "@/types/video";
 
 interface VideoGridItem {
   videoId: string;
@@ -8,6 +9,8 @@ interface VideoGridItem {
   channelName: string | null;
   publishedAt: string | null;
   viewCount: number | null;
+  status?: VideoStatus;
+  hideChannel?: boolean;
 }
 
 interface VideoGridProps {

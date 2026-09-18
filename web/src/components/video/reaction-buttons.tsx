@@ -56,9 +56,9 @@ export function ReactionButtons({
 
     try {
       if (nextReaction === null) {
-        await removeMyReaction(videoId, viewer.userId);
+        await removeMyReaction(videoId);
       } else {
-        await setMyReaction(videoId, viewer.userId, nextReaction);
+        await setMyReaction(videoId, nextReaction);
       }
     } catch {
       // Roll back to exactly what was on screen before the click — no
@@ -77,6 +77,7 @@ export function ReactionButtons({
         count={counts.likes}
         active={reaction === ReactionKind.Like}
         disabled={!canReact}
+        disabledReason={viewer ? undefined : "Sign in to react"}
         onClick={() => handleClick(ReactionKind.Like)}
       />
       <ReactionButton
@@ -84,6 +85,7 @@ export function ReactionButtons({
         count={counts.dislikes}
         active={reaction === ReactionKind.Dislike}
         disabled={!canReact}
+        disabledReason={viewer ? undefined : "Sign in to react"}
         onClick={() => handleClick(ReactionKind.Dislike)}
       />
     </div>
@@ -111,6 +113,7 @@ interface ReactionButtonProps {
   count: number;
   active: boolean;
   disabled: boolean;
+  disabledReason?: string;
   onClick: () => void;
 }
 
@@ -119,6 +122,7 @@ function ReactionButton({
   count,
   active,
   disabled,
+  disabledReason,
   onClick,
 }: ReactionButtonProps) {
   return (
@@ -127,7 +131,7 @@ function ReactionButton({
       onClick={onClick}
       disabled={disabled}
       aria-pressed={active}
-      title={active ? `You reacted: ${label}` : label}
+      title={disabled ? disabledReason : active ? `You reacted: ${label}` : label}
       className={`rounded-full px-3 py-1 transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
         active
           ? "bg-neutral-900 font-semibold text-white"
